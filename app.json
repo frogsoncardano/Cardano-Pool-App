@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "Frogs Cardano",
+    "slug": "frogs-cardano-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "android": {
+      "package": "com.frogs.cardanoapp",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B1410"
+      }
+    },
+    "plugins": [
+      [
+        "react-native-android-widget",
+        {
+          "widgets": [
+            {
+              "name": "FrogsPool",
+              "label": "Frogs Pool",
+              "description": "LEAP pool: epoch, blocks, delegators, stake",
+              "minWidth": "250dp",
+              "minHeight": "180dp",
+              "targetCellWidth": 4,
+              "targetCellHeight": 3,
+              "resizeMode": "horizontal|vertical",
+              "updatePeriodMillis": 1800000
+            },
+            {
+              "name": "FrogsBlocks",
+              "label": "Frogs Blocks",
+              "description": "Blocks produced this epoch + total",
+              "minWidth": "110dp",
+              "minHeight": "110dp",
+              "targetCellWidth": 2,
+              "targetCellHeight": 2,
+              "resizeMode": "horizontal|vertical",
+              "updatePeriodMillis": 1800000
+            }
+          ]
+        }
+      ]
+    ],
+    "icon": "./assets/icon.png"
+  }
+}
