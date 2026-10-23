@@ -1,10 +1,18 @@
 name: Build Android APK
 on:
   workflow_dispatch:
+    inputs:
+      template:
+        description: "Expo template: blank = newest SDK, blank@sdk-54 = SDK 54"
+        default: "blank"
 jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: [core, widgets]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,15 +24,22 @@ jobs:
           java-version: 17
       - name: Create Expo project and copy our files in
         run: |
-          npx create-expo-app@latest build --template blank --no-install --yes
-          cp App.js index.js app.json build/
+          npx create-expo-app@latest build --template "${{ inputs.template || 'blank' }}" --no-install --yes
+          cp App.js build/App.js
           mkdir -p build/assets && cp -r assets/. build/assets/
-          cp -r widget build/widget
+          if [ "${{ matrix.variant }}" = "widgets" ]; then
+            cp index.js build/index.js
+            cp app.json build/app.json
+            cp -r widget build/widget
+          else
+            cp index-core.js build/index.js
+            cp app-core.json build/app.json
+          fi
           cd build
           npm pkg set main=index.js
           npm install
           npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar
-          npm install react-native-android-widget
+          if [ "${{ matrix.variant }}" = "widgets" ]; then npx expo install react-native-android-widget; fi
       - name: Prebuild native Android project
         working-directory: build
         run: npx expo prebuild --platform android --no-install
@@ -33,5 +48,5 @@ jobs:
         run: ./gradlew assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: frogs-cardano-apk
+          name: frogs-apk-${{ matrix.variant }}
           path: build/android/app/build/outputs/apk/release/*.apk
