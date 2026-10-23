@@ -171,12 +171,35 @@ const s = StyleSheet.create({
   barBg: { height: 10, borderRadius: 6, backgroundColor: colors.border, overflow: "hidden", marginVertical: 8 },
   barFill: { height: 10, borderRadius: 6 }
 });
+const rewardOf = (e) => {
+  const d = Number(e && e.deleg_rewards || 0);
+  if (d > 0) return d;
+  const m = Number(e && e.member_rewards || 0);
+  return m > 0 ? m : 0;
+};
 function PoolDetail({ poolId }) {
   const info = useAsync(() => getPoolInfo(poolId), [poolId]);
   const hist = useAsync(() => getPoolHistory(poolId), [poolId]);
   const blocks = useAsync(() => getPoolBlocks(poolId), [poolId]);
   const dels = useAsync(() => getDelegators(poolId), [poolId]);
   const tip = useAsync(() => getTip(), []);
+  // Koios' pool_history is a cache and some epochs can come back with 0 rewards. Re-ask for those epochs one by one.
+  const repair = useAsync(async () => {
+    const rows = hist.data || [];
+    const cur = tip.data && tip.data.epoch_no;
+    if (cur == null) return {};
+    const missing = rows.filter((e) => (e.block_cnt || 0) > 0 && rewardOf(e) === 0 && e.epoch_no <= cur - 2).sort((a, b) => b.epoch_no - a.epoch_no).slice(0, 10);
+    const out = {};
+    for (const e of missing) {
+      for (let attempt = 0; attempt < 2 && !out[e.epoch_no]; attempt++) {
+        try {
+          const r = await get(`/pool_history?_pool_bech32=${poolId}&_epoch_no=${e.epoch_no}`);
+          if (r && r[0] && rewardOf(r[0]) > 0) out[e.epoch_no] = r[0];
+        } catch (err) {}
+      }
+    }
+    return out;
+  }, [hist.data, tip.data, poolId]);
   const reload = () => {
     tip.reload();
     info.reload();
@@ -237,11 +260,28 @@ function PoolDetail({ poolId }) {
 
       <Title>Epoch history</Title>
       <Card>
-        {hist.loading ? <Loading /> : lastEpochs.map((e) => <View key={e.epoch_no} style={{ paddingVertical: 6, borderBottomColor: colors.border, borderBottomWidth: 1 }}>
-            <Row label={`Epoch ${e.epoch_no}`} value={`${e.block_cnt ?? 0} blocks \xB7 ${e.delegator_cnt ?? 0} delegators`} />
-            <Row label="Stake / ROS" value={`${fmtAda(e.active_stake)} \xB7 ${Number(e.epoch_ros ?? 0).toFixed(2)}%`} />
-            <Row label="Delegator rewards" value={fmtAda(e.deleg_rewards, 1)} />
-          </View>)}
+        {hist.loading ? <Loading /> : lastEpochs.map((e) => {
+    const fix = (repair.data || {})[e.epoch_no];
+    const src = fix || e;
+    const rew = rewardOf(src);
+    const stake = Number(src.active_stake || e.active_stake || 0);
+    const nBlocks = e.block_cnt ?? 0;
+    const cur = curEpoch;
+    const pending = cur != null && e.epoch_no > cur - 2 && rew === 0;
+    const gap = !pending && nBlocks > 0 && rew === 0;
+    // ROS = delegator rewards / active stake, annualised (73 epochs a year)
+    const ros = rew > 0 && stake > 0 ? rew / stake * 73 * 100 : 0;
+    let fees = Number(src.pool_fees || 0);
+    if (!(fees > 0) && nBlocks > 0 && rew > 0 && Number(e.margin || 0) === 0) fees = Number(e.fixed_cost || 0);
+    const rewardText = pending ? "pending" : gap ? (repair.loading ? "checking\u2026" : "n/a (Koios gap)") : fmtAda(rew, 1);
+    const rewardColor = pending ? colors.muted : gap ? colors.warn : undefined;
+    return <View key={e.epoch_no} style={{ paddingVertical: 6, borderBottomColor: colors.border, borderBottomWidth: 1 }}>
+            <Row label={`Epoch ${e.epoch_no}`} value={`${nBlocks} ${nBlocks === 1 ? "block" : "blocks"} \xB7 ${e.delegator_cnt ?? 0} delegators`} />
+            <Row label="Stake / ROS" value={`${fmtAda(e.active_stake)} \xB7 ${pending || gap ? "\u2014" : ros.toFixed(2) + "%"}`} />
+            <Row label="Delegator rewards" value={rewardText} color={rewardColor} />
+            <Row label="Epoch pool fees" value={pending ? "pending" : fees > 0 ? fmtAda(fees, 1) : nBlocks > 0 ? "n/a" : "0 \u20B3"} color={pending ? colors.muted : undefined} />
+          </View>;
+  })}
       </Card>
 
       <Title>Recent blocks</Title>
@@ -463,119 +503,33 @@ function ExploreScreen() {
       </Card>
     </Screen>;
 }
-function LiveScreen() {
-  const [blocks, setBlocks] = useState([]);
-  const [names, setNames] = useState({});
-  const [mine, setMine] = useState({});
-  const [err, setErr] = useState(null);
-  const [banner, setBanner] = useState(null);
-  const [now, setNow] = useState(Date.now() / 1e3);
-  const [updated, setUpdated] = useState(null);
-  const [poolMissing, setPoolMissing] = useState(false);
-  const cache = useRef({});
-  const lastTop = useRef(0);
-  useEffect(() => {
-    let alive = true;
-    async function tick() {
-      try {
-        let list = await getLatestBlocks(15);
-        if (!alive) return;
-        // Some Koios responses leave "pool" empty on the summary list; ask the detailed endpoint for it.
-        if (!list.some((x) => x.pool)) {
-          try {
-            const det = await post("/block_info", { _block_hashes: list.map((x) => x.hash) });
-            const m = {};
-            det.forEach((d) => { m[d.hash] = d.pool; });
-            list = list.map((x) => ({ ...x, pool: x.pool || m[x.hash] || null }));
-          } catch (e) {}
-        }
-        setPoolMissing(!list.some((x) => x.pool));
-        const favs = await loadFavs();
-        const watchIds = [...new Set([POOL_ID, ...favs.map((f) => f.id)])];
-        // Blocks minted by watched pools (works even if the pool field is empty above)
-        const mineMap = {};
-        for (const id of watchIds) {
-          try {
-            const pb = await getPoolBlocks(id);
-            pb.forEach((x) => { mineMap[x.block_hash] = id; });
-          } catch (e) {}
-        }
-        const need = [...new Set([...list.map((x) => x.pool), ...watchIds].filter((id) => id && !cache.current[id]))];
-        if (need.length) {
-          const infos = await getPoolInfos(need).catch(() => []);
-          for (const i of infos) cache.current[i.pool_id_bech32] = i.meta_json && i.meta_json.ticker || short(i.pool_id_bech32, 6);
-          setNames({ ...cache.current });
-        }
-        const top = Math.max(...list.map((x) => x.block_height));
-        if (lastTop.current > 0) {
-          const hit = list.find((x) => x.block_height > lastTop.current && (mineMap[x.hash] || watchIds.includes(x.pool)));
-          if (hit) {
-            const pid = mineMap[hit.hash] || hit.pool;
-            setBanner(`\u{1F438} ${cache.current[pid] || "Your pool"} minted block #${hit.block_height}!`);
-          }
-        }
-        lastTop.current = top;
-        const mm = {};
-        list.forEach((x) => { const pid = mineMap[x.hash] || (watchIds.includes(x.pool) ? x.pool : null); if (pid) mm[x.hash] = pid; });
-        setMine(mm);
-        setBlocks(list);
-        setErr(null);
-        setUpdated(Date.now() / 1e3);
-      } catch (e) { if (alive) setErr(e.message); }
+class ErrorBoundary extends React.Component {
+  constructor(p) { super(p); this.state = { err: null }; }
+  static getDerivedStateFromError(e) { return { err: e }; }
+  render() {
+    if (this.state.err) {
+      return <ScrollView style={{ flex: 1, backgroundColor: colors.bg }} contentContainerStyle={{ padding: 24, paddingTop: 60 }}>
+          <Text style={{ color: colors.danger, fontSize: 18, fontWeight: "800" }}>The app hit an error</Text>
+          <Text style={{ color: colors.muted, marginVertical: 8 }}>Please screenshot this screen and send it to Claude:</Text>
+          <Text selectable style={{ color: colors.text, fontSize: 12 }}>{String(this.state.err && this.state.err.stack || this.state.err)}</Text>
+        </ScrollView>;
     }
-    tick();
-    const t = setInterval(tick, 2e4);
-    const c = setInterval(() => setNow(Date.now() / 1e3), 1e3);
-    return () => { alive = false; clearInterval(t); clearInterval(c); };
-  }, []);
-  const age = (t) => { const d = Math.max(0, Math.floor(now - t)); return d < 60 ? `${d}s ago` : `${Math.floor(d / 60)}m ${d % 60}s ago`; };
-  const label = (b) => {
-    const pid = mine[b.hash] || b.pool;
-    if (pid) return `[${names[pid] || "\u2026"}]`;
-    return `[${short(b.vrf_key || "?", 6)}]`;
-  };
-  return <Screen>
-      <Card>
-        <Text style={{ color: colors.green, fontWeight: "800", fontSize: 16 }}>● Live blocks</Text>
-        <Text style={{ color: colors.muted, fontSize: 12 }}>
-          Refreshes every 20 s{updated ? ` · updated ${age(updated)}` : ""}. Blocks from LEAP and your saved pools are highlighted.
-        </Text>
-        {poolMissing ? <Text style={{ color: colors.warn, fontSize: 12, marginTop: 6 }}>Koios did not return pool names for these blocks, so other pools show their VRF key instead. Your own pools are still detected.</Text> : null}
-      </Card>
-      {banner ? <Pressable onPress={() => setBanner(null)}>
-          <Card style={{ borderColor: colors.lime }}><Text style={{ color: colors.lime, fontWeight: "700" }}>{banner}</Text></Card>
-        </Pressable> : null}
-      {err ? <ErrorText msg={err} /> : null}
-      <Card>
-        {blocks.length === 0 && !err ? <Loading /> : blocks.map((b) => {
-    const isMine = !!mine[b.hash];
-    return <View key={b.hash} style={{ paddingVertical: 8, borderBottomColor: colors.border, borderBottomWidth: 1, backgroundColor: isMine ? "#16301F" : "transparent", paddingHorizontal: isMine ? 8 : 0, borderRadius: 8 }}>
-          <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
-            <Text style={{ color: colors.text, fontWeight: "700" }}>{isMine ? "\u{1F438} " : ""}#{b.block_height}</Text>
-            <Text style={{ color: isMine ? colors.lime : colors.green, fontWeight: "700" }}>{label(b)}</Text>
-          </View>
-          <Text style={{ color: colors.muted, fontSize: 12 }}>
-            epoch {b.epoch_no} · slot {b.epoch_slot} · {b.tx_count} tx · {(b.block_size / 1024).toFixed(1)} KB · {age(b.block_time)}
-          </Text>
-        </View>;
-  })}
-      </Card>
-    </Screen>;
+    return this.props.children;
+  }
 }
 const Tab = createBottomTabNavigator();
 const tabIcon = (emoji) => ({ focused }) => <Text style={{ fontSize: 20, opacity: focused ? 1 : 0.5 }}>{emoji}</Text>;
 const theme = { ...DarkTheme, colors: { ...DarkTheme.colors, background: colors.bg, card: colors.card, border: colors.border, primary: colors.green, text: colors.text } };
 function App() {
-  return <NavigationContainer theme={theme}>
+  return <ErrorBoundary><NavigationContainer theme={theme}>
       <StatusBar style="light" />
       <Tab.Navigator screenOptions={{ tabBarActiveTintColor: colors.green, tabBarInactiveTintColor: colors.muted, headerStyle: { backgroundColor: colors.card }, headerTintColor: colors.text, tabBarStyle: { backgroundColor: colors.card, borderTopColor: colors.border } }}>
-        <Tab.Screen name="Frogs Pool" component={PoolScreen} options={{ title: "\u{1F438} Frogs Pool", tabBarIcon: tabIcon("\u{1F438}") }} />
-        <Tab.Screen name="Live" component={LiveScreen} options={{ title: "\u{1F4E1} Live Blocks", tabBarIcon: tabIcon("\u{1F4E1}") }} />
-        <Tab.Screen name="Epoch" component={EpochScreen} options={{ title: "\u23F3 Epoch", tabBarIcon: tabIcon("\u23F3") }} />
-        <Tab.Screen name="Wallet" component={WalletScreen} options={{ title: "\u{1F45B} Wallet", tabBarIcon: tabIcon("\u{1F45B}") }} />
-        <Tab.Screen name="Explore" component={ExploreScreen} options={{ title: "\u{1F50E} Explore", tabBarIcon: tabIcon("\u{1F50E}") }} />
+        <Tab.Screen name="Frogs Pool" component={PoolScreen} options={{ title: "Frogs Pool", tabBarIcon: tabIcon("\u{1F438}") }} />
+        <Tab.Screen name="Epoch" component={EpochScreen} options={{ title: "Epoch", tabBarIcon: tabIcon("\u23F3") }} />
+        <Tab.Screen name="Wallet" component={WalletScreen} options={{ title: "Wallet", tabBarIcon: tabIcon("\u{1F45B}") }} />
+        <Tab.Screen name="Explore" component={ExploreScreen} options={{ title: "Explore", tabBarIcon: tabIcon("\u{1F50E}") }} />
       </Tab.Navigator>
-    </NavigationContainer>;
+    </NavigationContainer></ErrorBoundary>;
 }
 var App_default = App;
 export {

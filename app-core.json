@@ -1,0 +1,16 @@
+{
+  "expo": {
+    "name": "Frogs Cardano (core)",
+    "slug": "frogs-cardano-app",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "android": {
+      "package": "com.frogs.cardanoapp",
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0B1410"
+      }
+    },
+    "icon": "./assets/icon.png"
+  }
+}
