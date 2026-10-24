@@ -1,5 +1,6 @@
 import React from 'react';
-import { FlexWidget, TextWidget } from 'react-native-android-widget';
+import { FlexWidget, TextWidget, ImageWidget } from 'react-native-android-widget';
+import { LOGO } from './logo';
 
 const C = { bg: '#0B1410', head: '#050A07', card: '#14221B', green: '#4ADE80', lime: '#A3E635', text: '#ECFDF5', muted: '#86A595', danger: '#F87171' };
 
@@ -33,10 +34,9 @@ export function FrogsWidget({ d, time, error }) {
       {/* header */}
       <FlexWidget style={{ width: 'match_parent', flexDirection: 'row', justifyContent: 'space-between', alignItems: 'center', backgroundColor: C.head, paddingHorizontal: 14, paddingVertical: 10, borderTopLeftRadius: 22, borderTopRightRadius: 22 }}>
         <FlexWidget style={{ flexDirection: 'row', alignItems: 'center' }}>
-          <TextWidget text="🐸" style={{ fontSize: 26 }} />
-          <FlexWidget style={{ marginLeft: 8 }}>
-            <TextWidget text="Frogs" style={{ fontSize: 17, color: C.text, fontWeight: 'bold' }} />
-            <TextWidget text="Cardano" style={{ fontSize: 13, color: C.muted }} />
+          <ImageWidget image={LOGO} imageWidth={44} imageHeight={44} />
+          <FlexWidget style={{ marginLeft: 10 }}>
+            <TextWidget text="Frog Labs" style={{ fontSize: 19, color: C.text, fontWeight: 'bold' }} />
           </FlexWidget>
         </FlexWidget>
         {d ? (
@@ -93,7 +93,10 @@ export function FrogsBlocksWidget({ d, time, error }) {
         <TextWidget text={error ? 'Error: ' + error : 'Loading…'} style={{ fontSize: 12, color: C.danger }} />
       ) : (
         <FlexWidget style={{ alignItems: 'center' }}>
-          <TextWidget text={'🐸 ' + d.ticker} style={{ fontSize: 14, color: C.green, fontWeight: 'bold' }} />
+          <FlexWidget style={{ flexDirection: 'row', alignItems: 'center' }}>
+            <ImageWidget image={LOGO} imageWidth={22} imageHeight={22} />
+            <TextWidget text={'  ' + d.ticker} style={{ fontSize: 14, color: C.green, fontWeight: 'bold' }} />
+          </FlexWidget>
           <TextWidget text={String(d.epochBlocks)} style={{ fontSize: 38, color: C.text, fontWeight: 'bold' }} />
           <TextWidget text="blocks this epoch" style={{ fontSize: 11, color: C.muted }} />
           <TextWidget text={'Total ' + d.lifetimeBlocks} style={{ fontSize: 12, color: C.text }} />

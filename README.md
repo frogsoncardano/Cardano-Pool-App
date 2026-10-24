@@ -1,4 +1,4 @@
-# Frogs Cardano App
+# Frog Labs App
 
 Quick test (no install): paste App.js into snack.expo.dev.
 
