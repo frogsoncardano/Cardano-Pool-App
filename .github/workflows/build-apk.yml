@@ -43,6 +43,11 @@ jobs:
       - name: Prebuild native Android project
         working-directory: build
         run: npx expo prebuild --platform android --no-install
+      - name: Keep WorkManager classes (fixes widget crash on launch)
+        working-directory: build/android
+        run: |
+          printf '\nandroid.enableProguardInReleaseBuilds=false\nandroid.enableMinifyInReleaseBuilds=false\nandroid.enableShrinkResourcesInReleaseBuilds=false\n' >> gradle.properties
+          printf '\n-keep class androidx.work.** { *; }\n-keep class * extends androidx.room.RoomDatabase { *; }\n-dontwarn androidx.work.**\n' >> app/proguard-rules.pro
       - name: Build APK
         working-directory: build/android
         run: ./gradlew assembleRelease --no-daemon
