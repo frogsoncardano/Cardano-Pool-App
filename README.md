@@ -10,3 +10,7 @@ If the app shows a red-ish "The app hit an error" screen, screenshot it.
 
 Run: GitHub > Actions > Build Android APK > Run workflow.
 Template box: leave "blank" (newest SDK). If both crash, try "blank@sdk-54".
+
+Widgets (long-press home screen > Widgets > Frog Labs):
+  Frog Labs Pool (big), Frog Labs Pool Mini (2x1), Frog Labs ADA / NIGHT / BTC (2x1 price widgets).
+To show a different pool on the pool widgets: Explore > open a pool > "Use for widget", then tap the widget's refresh button.

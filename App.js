@@ -54,7 +54,61 @@ async function resolveStake(input) {
 }
 const getAccount = (stake) => post("/account_info", { _stake_addresses: [stake] }).then((r) => r[0]);
 const getAccountRewards = (stake) => post("/account_rewards", { _stake_addresses: [stake] }).then((r) => r[0]?.rewards ?? []);
-const getAccountAssets = (stake) => post("/account_assets", { _stake_addresses: [stake] }).then((r) => r[0]?.asset_list ?? []);
+// Koios >= 1.1 returns one row per asset; older versions nested them in asset_list. Handle both.
+const getAccountAssets = async (stake) => {
+  const r = await post("/account_assets", { _stake_addresses: [stake] });
+  const rows = [];
+  for (const row of r || []) {
+    if (Array.isArray(row.asset_list)) rows.push(...row.asset_list);
+    else if (row.policy_id) rows.push(row);
+  }
+  return rows;
+};
+const CIP68_PREFIXES = ["000de140", "000643b0", "0014df10", "001bc280"];
+function assetLabel(a) {
+  if (a.asset_name_ascii) return a.asset_name_ascii;
+  let hex = a.asset_name || "";
+  if (CIP68_PREFIXES.some((p) => hex.startsWith(p))) hex = hex.slice(8);
+  if (!hex) return short(a.fingerprint || a.policy_id || "?", 6);
+  let txt = "";
+  for (let i = 0; i + 1 < hex.length; i += 2) txt += String.fromCharCode(parseInt(hex.slice(i, i + 2), 16));
+  return /^[\x20-\x7e]+$/.test(txt) ? txt : short(a.fingerprint || hex, 6);
+}
+function fmtQty(q, decimals) {
+  const d = Number(decimals) || 0;
+  const n = Number(q) / Math.pow(10, d);
+  return isFinite(n) ? n.toLocaleString("en-US", { maximumFractionDigits: Math.min(d, 6) }) : String(q);
+}
+
+// Groups a wallet's NFTs by policy and names each collection from its asset names ("Frog #12", "Frog #13" -> "Frog").
+const nftBase = (n) => n.replace(/[\s#_\-.]*\d+\s*$/, "").replace(/[\s#_\-.]+$/, "").trim();
+const commonPrefix = (names) => {
+  let p = names[0] || "";
+  for (const n of names) while (p && !n.startsWith(p)) p = p.slice(0, -1);
+  return p.replace(/[\s#_\-.]+$/, "").trim();
+};
+const nftLabel = (a) => a.policy_id === HANDLE_POLICY ? "$" + assetLabel(a) : assetLabel(a);
+function groupNfts(nfts) {
+  const byPolicy = {};
+  for (const a of nfts) (byPolicy[a.policy_id] = byPolicy[a.policy_id] || []).push(a);
+  const groups = Object.entries(byPolicy).map(([policy, list]) => {
+    const items = [...list].sort((x, y) => nftLabel(x).localeCompare(nftLabel(y), "en", { numeric: true }));
+    let name;
+    if (policy === HANDLE_POLICY) name = "ADA Handles";
+    else if (items.length === 1) name = nftLabel(items[0]);
+    else {
+      const bases = items.map((a) => nftBase(assetLabel(a))).filter(Boolean);
+      const counts = {};
+      for (const b of bases) counts[b] = (counts[b] || 0) + 1;
+      const top = Object.entries(counts).sort((x, y) => y[1] - x[1])[0];
+      if (top && top[1] >= items.length / 2) name = top[0];
+      else { const lcp = commonPrefix(bases); name = lcp.length >= 3 ? lcp : "Collection " + short(policy, 5); }
+    }
+    return { policy, name, items };
+  });
+  return groups.sort((x, y) => y.items.length - x.items.length || x.name.localeCompare(y.name));
+}
+const isNftAsset = (a) => String(a.quantity) === "1" && !(Number(a.decimals) > 0);
 
 const B32 = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 function b32Polymod(v) {
@@ -111,6 +165,151 @@ async function searchSpos(q) {
   return infos.sort((a, b) => Number(b.live_stake || 0) - Number(a.live_stake || 0));
 }
 const getLatestBlocks = (n = 15) => get(`/blocks?order=block_height.desc&limit=${n}`);
+
+// ---------- prices (CoinGecko, no key needed) ----------
+const COINS = [
+  { id: "bitcoin", sym: "BTC", name: "Bitcoin" },
+  { id: "cardano", sym: "ADA", name: "Cardano" },
+  { id: "midnight-3", sym: "NIGHT", name: "Midnight" },
+];
+const fmtNum = (n) => {
+  if (n == null) return "\u2014";
+  if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  if (n >= 1) return n.toFixed(2);
+  if (n >= 0.1) return n.toFixed(3);
+  return n.toFixed(4);
+};
+const fmtUsd = (n) => n == null ? "\u2014" : "$" + fmtNum(n);
+async function getPrices() {
+  const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${COINS.map((c) => c.id).join(",")}&price_change_percentage=24h`);
+  if (!r.ok) throw new Error("CoinGecko " + r.status);
+  const rows = await r.json();
+  return COINS.map((c) => ({ ...c, ...(rows.find((x) => x.id === c.id) || {}) }));
+}
+// ---------- pool logos (CIP-6 extended metadata) ----------
+const logoCache = {};
+const fixUrl = (u) => !u ? null : u.startsWith("ipfs://") ? "https://ipfs.io/ipfs/" + u.slice(7).replace(/^ipfs\//, "") : u.replace(/^http:/, "https:");
+async function fetchJsonTimeout(url, ms = 6e3) {
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const t = setTimeout(() => ctl && ctl.abort(), ms);
+  try {
+    const r = await fetch(url, ctl ? { signal: ctl.signal } : undefined);
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+async function getPoolLogoUrl(p) {
+  const id = p && p.pool_id_bech32;
+  if (!id) return null;
+  if (id in logoCache) return logoCache[id];
+  let url = null;
+  try {
+    let ext = p.meta_json && p.meta_json.extended;
+    if (!ext && p.meta_url) { const m = await fetchJsonTimeout(fixUrl(p.meta_url)); ext = m && m.extended; }
+    if (ext) {
+      const e = await fetchJsonTimeout(fixUrl(ext));
+      const info = e && e.info || e || {};
+      url = fixUrl(info.url_png_icon_64x64 || info.url_png_logo || null);
+    }
+  } catch (e) {}
+  logoCache[id] = url;
+  return url;
+}
+function PoolLogo({ pool, size = 36 }) {
+  const [uri, setUri] = useState(null);
+  useEffect(() => {
+    let alive = true;
+    getPoolLogoUrl(pool).then((u) => { if (alive) setUri(u); });
+    return () => { alive = false; };
+  }, [pool && pool.pool_id_bech32]);
+  const t = pool && pool.meta_json && pool.meta_json.ticker || "?";
+  if (uri) return <Image source={{ uri }} onError={() => setUri(null)} style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: colors.border }} />;
+  return <View style={{ width: size, height: size, borderRadius: size / 2, backgroundColor: colors.border, alignItems: "center", justifyContent: "center" }}>
+      <Text style={{ color: colors.green, fontWeight: "800", fontSize: size * 0.36 }}>{String(t).slice(0, 2)}</Text>
+    </View>;
+}
+
+// ---------- ADA Handle ($name) support ----------
+const HANDLE_POLICY = "f0ff48bbb7bbe9d59a40f1ce90e9e9d0ff5002ec48f232b49ca0fb9a";
+const isHandle = (v) => /^\$?[a-z0-9_.-]{1,15}$/i.test(v.trim());
+const asciiHex = (str) => [...str].map((c) => c.charCodeAt(0).toString(16).padStart(2, "0")).join("");
+// Finds the address currently holding the handle NFT. Tries the classic asset name, then the CIP-68 one (prefix 000de140).
+async function handleHolderAddress(name) {
+  const hex = asciiHex(name);
+  for (const assetName of [hex, "000de140" + hex]) {
+    try {
+      const r = await get(`/asset_nft_address?_asset_policy=${HANDLE_POLICY}&_asset_name=${assetName}`);
+      const a = r && r[0] && r[0].payment_address;
+      if (a) return a;
+    } catch (e) {}
+    try {
+      const r = await get(`/asset_addresses?_asset_policy=${HANDLE_POLICY}&_asset_name=${assetName}`);
+      const row = (r || []).find((x) => Number(x.quantity ?? 1) > 0);
+      if (row && row.payment_address) return row.payment_address;
+    } catch (e) {}
+  }
+  // last resort: the public Handle API
+  try {
+    const r = await fetchJsonTimeout(`https://api.handle.me/handles/${name}`, 8e3);
+    const a = r && (r.holder || r.resolved_addresses && r.resolved_addresses.ada);
+    if (a) return a;
+  } catch (e) {}
+  return null;
+}
+// $handle, addr1... or stake1... -> { stake, handle }
+async function resolveWallet(input) {
+  const v = input.trim();
+  if (v.startsWith("stake1")) return { stake: v, handle: null };
+  if (v.startsWith("addr1")) return { stake: await resolveStake(v), handle: null };
+  if (isHandle(v)) {
+    const name = v.replace(/^\$/, "").toLowerCase();
+    const addr = await handleHolderAddress(name);
+    if (!addr) throw new Error(`Handle $${name} was not found`);
+    if (addr.startsWith("stake1")) return { stake: addr, handle: "$" + name };
+    try {
+      return { stake: await resolveStake(addr), handle: "$" + name };
+    } catch (e) {
+      throw new Error(`$${name} is held by an address without a stake key, so its balance can't be tracked`);
+    }
+  }
+  throw new Error("Enter a $handle, stake1\u2026 or addr1\u2026 address");
+}
+const HANDLE_KEY = "wallet:handle";
+
+// ---------- governance (Conway era governance actions) ----------
+const GOV_TYPES = {
+  ParameterChange: "Parameter change",
+  HardForkInitiation: "Hard fork",
+  TreasuryWithdrawals: "Treasury withdrawal",
+  NoConfidence: "No confidence",
+  NewCommittee: "Update committee",
+  NewConstitution: "New constitution",
+  InfoAction: "Info action",
+};
+const govTypeLabel = (t) => GOV_TYPES[t] || t || "Unknown";
+const govBody = (p) => { const m = p && p.meta_json || {}; return m.body || m; };
+const govTitle = (p) => {
+  const b = govBody(p);
+  return b && typeof b.title === "string" && b.title.trim() || null;
+};
+const govText = (p, key) => { const b = govBody(p); return b && typeof b[key] === "string" ? b[key].trim() : ""; };
+const govWithdrawals = (p) => { const w = p && p.withdrawal; return !w ? [] : Array.isArray(w) ? w : [w]; };
+const govRequested = (p) => govWithdrawals(p).reduce((sum, x) => sum + Number(x.amount || 0), 0); // lovelace
+const govStatus = (p) => p.enacted_epoch != null ? "Enacted" : p.ratified_epoch != null ? "Ratified" : p.dropped_epoch != null ? "Dropped" : p.expired_epoch != null ? "Expired" : "Active";
+const govKey = (p) => p.proposal_id || `${p.proposal_tx_hash}#${p.proposal_index}`;
+const getProposals = () => get("/proposal_list?order=proposed_epoch.desc&limit=100");
+async function getVotingSummary(p) {
+  const ids = [p.proposal_id, p.proposal_tx_hash != null ? `${p.proposal_tx_hash}#${p.proposal_index}` : null].filter(Boolean);
+  let last = null;
+  for (const id of ids) {
+    try {
+      const r = await get(`/proposal_voting_summary?_proposal_id=${encodeURIComponent(id)}`);
+      if (r && r[0]) return r[0];
+    } catch (e) { last = e; }
+  }
+  if (last) throw last;
+  return null;
+}
 const FAV_KEY = "fav:pools";
 const WIDGET_KEY = "widget:pool";
 async function loadFavs() {
@@ -234,10 +433,13 @@ function PoolDetail({ poolId }) {
         ) : null}
       </Card>
       <Card>
-        <Text style={{ color: colors.text, fontSize: 22, fontWeight: "800" }}>
-          [{meta.ticker ?? "\u2014"}] {meta.name ?? ""}
-        </Text>
-        <Text style={{ color: colors.muted, marginTop: 4 }}>{meta.description ?? ""}</Text>
+        <View style={{ flexDirection: "row", alignItems: "center" }}>
+          <PoolLogo pool={p} size={52} />
+          <Text style={{ color: colors.text, fontSize: 22, fontWeight: "800", marginLeft: 12, flexShrink: 1 }}>
+            [{meta.ticker ?? "\u2014"}] {meta.name ?? ""}
+          </Text>
+        </View>
+        <Text style={{ color: colors.muted, marginTop: 8 }}>{meta.description ?? ""}</Text>
         <Row label="Status" value={p.pool_status ?? "\u2014"} color={p.pool_status === "registered" ? colors.green : colors.warn} />
         {p.retiring_epoch ? <Row label="Retiring epoch" value={String(p.retiring_epoch)} color={colors.danger} /> : null}
       </Card>
@@ -296,10 +498,6 @@ function PoolDetail({ poolId }) {
       </Card>
     </Screen>;
 }
-function PoolScreen() {
-  if (POOL_ID.includes("REPLACE_ME")) return <ErrorText msg="Set POOL_ID in src/config.ts" />;
-  return <PoolDetail poolId={POOL_ID} />;
-}
 function EpochScreen() {
   const { data, error, loading, reload } = useAsync(async () => {
     const tip2 = await getTip();
@@ -307,17 +505,19 @@ function EpochScreen() {
     return { tip: tip2, ep: ep2 };
   });
   const [now, setNow] = useState(Date.now() / 1e3);
+  const [priceTick, setPriceTick] = useState(0);
+  const refreshAll = () => { reload(); setPriceTick((t) => t + 1); };
   useEffect(() => {
     const t = setInterval(() => setNow(Date.now() / 1e3), 1e3);
     return () => clearInterval(t);
   }, []);
   if (loading && !data) return <Loading />;
-  if (error || !data) return <ErrorText msg={error ?? "No data"} />;
+  if (error || !data) return <Screen onRefresh={refreshAll} refreshing={loading}><ErrorText msg={error ?? "No data"} /><PriceCards refreshKey={priceTick} /></Screen>;
   const { tip, ep } = data;
   const left = Math.max(0, ep.end_time - now);
   const pct = (EPOCH_SECONDS - left) / EPOCH_SECONDS * 100;
   const d = Math.floor(left / 86400), h = Math.floor(left % 86400 / 3600), m = Math.floor(left % 3600 / 60), sec = Math.floor(left % 60);
-  return <Screen onRefresh={reload} refreshing={loading}>
+  return <Screen onRefresh={refreshAll} refreshing={loading}>
       <Card>
         <Text style={{ color: colors.muted }}>Epoch</Text>
         <Text style={{ color: colors.green, fontSize: 44, fontWeight: "800" }}>{tip.epoch_no}</Text>
@@ -334,12 +534,15 @@ function EpochScreen() {
         <Row label="Volume" value={fmtAda(ep.out_sum)} />
         <Row label="Ends" value={new Date(ep.end_time * 1e3).toLocaleString()} />
       </Card>
+      <PriceCards refreshKey={priceTick} />
     </Screen>;
 }
 const KEY = "wallet:stake";
 function WalletScreen() {
   const [input, setInput] = useState("");
   const [stake, setStake] = useState(null);
+  const [handle, setHandle] = useState(null);
+  const [open, setOpen] = useState({});
   const [acc, setAcc] = useState(null);
   const [rewards, setRewards] = useState([]);
   const [assets, setAssets] = useState([]);
@@ -361,21 +564,28 @@ function WalletScreen() {
   async function connect() {
     try {
       setErr(null);
-      const s2 = await resolveStake(input);
-      await AsyncStorage.setItem(KEY, s2);
-      setStake(s2);
-      load(s2);
+      setLoading(true);
+      const w = await resolveWallet(input);
+      await AsyncStorage.setItem(KEY, w.stake);
+      if (w.handle) await AsyncStorage.setItem(HANDLE_KEY, w.handle); else await AsyncStorage.removeItem(HANDLE_KEY);
+      setHandle(w.handle);
+      setStake(w.stake);
+      load(w.stake);
     } catch (e) {
       setErr(e.message);
+      setLoading(false);
     }
   }
   async function disconnect() {
     await AsyncStorage.removeItem(KEY);
+    await AsyncStorage.removeItem(HANDLE_KEY);
+    setHandle(null);
     setStake(null);
     setAcc(null);
     setInput("");
   }
   useEffect(() => {
+    AsyncStorage.getItem(HANDLE_KEY).then((h) => { if (h) setHandle(h); });
     AsyncStorage.getItem(KEY).then((s2) => {
       if (s2) {
         setStake(s2);
@@ -386,40 +596,66 @@ function WalletScreen() {
   if (!stake)
     return <Screen>
         <Title>Connect wallet (read-only)</Title>
+        <Text style={{ color: colors.muted, fontSize: 12, marginBottom: 8 }}>Type your ADA Handle or paste a stake / payment address.</Text>
         <Card>
           <TextInput
       value={input}
       onChangeText={setInput}
-      placeholder="stake1… or addr1…"
+      placeholder="$handle, stake1… or addr1…"
       placeholderTextColor={colors.muted}
       autoCapitalize="none"
       autoCorrect={false}
       style={{ color: colors.text, borderColor: colors.border, borderWidth: 1, borderRadius: 10, padding: 12 }}
     />
           <Pressable onPress={connect} style={{ backgroundColor: colors.green, borderRadius: 10, padding: 12, marginTop: 12 }}>
-            <Text style={{ textAlign: "center", fontWeight: "800", color: "#04210F" }}>Connect</Text>
+            <Text style={{ textAlign: "center", fontWeight: "800", color: "#04210F" }}>{loading ? "Looking up\u2026" : "Connect"}</Text>
           </Pressable>
           {err && <ErrorText msg={err} />}
         </Card>
       </Screen>;
+  const byName = (x, y) => assetLabel(x).localeCompare(assetLabel(y));
+  const nfts = assets.filter(isNftAsset);
+  const groups = groupNfts(nfts);
+  const tokens = assets.filter((a) => !isNftAsset(a)).sort(byName);
+  const lastEpochs = [...new Set(rewards.map((r) => r.earned_epoch))].slice(0, 6);
+  const recentRewards = rewards.filter((r) => lastEpochs.includes(r.earned_epoch));
   return <Screen onRefresh={() => load(stake)} refreshing={loading}>
       {loading && !acc ? <Loading /> : <>
           <Card>
             <Text style={{ color: colors.muted }}>Total balance</Text>
             <Text style={{ color: colors.green, fontSize: 32, fontWeight: "800" }}>{fmtAda(acc?.total_balance, 2)}</Text>
+            {handle ? <Row label="Handle" value={handle} color={colors.lime} /> : null}
             <Row label="Stake address" value={short(stake, 10)} />
             <Row label="Delegated pool" value={acc?.delegated_pool ? short(acc.delegated_pool, 10) : "Not delegated"} />
             <Row label="Rewards available" value={fmtAda(acc?.rewards_available, 2)} />
             <Row label="Withdrawn" value={fmtAda(acc?.withdrawals_sum, 2)} />
           </Card>
-          <Title>Rewards history</Title>
+          <Title>Rewards (last 6 epochs)</Title>
           <Card>
-            {rewards.slice(0, 15).map((r, i) => <Row key={i} label={`Epoch ${r.earned_epoch} (${r.type})`} value={`+${ada(r.amount).toFixed(2)} \u20B3`} />)}
+            {recentRewards.map((r, i) => <Row key={i} label={`Epoch ${r.earned_epoch} (${r.type})`} value={`+${ada(r.amount).toFixed(2)} \u20B3`} />)}
             {rewards.length === 0 && <Text style={{ color: colors.muted }}>No rewards yet</Text>}
           </Card>
-          <Title>Assets ({assets.length})</Title>
+          <Title>Tokens ({tokens.length})</Title>
           <Card>
-            {assets.slice(0, 20).map((a, i) => <Row key={i} label={short(a.policy_id, 6)} value={`${a.quantity}`} />)}
+            {tokens.slice(0, 40).map((a, i) => <Row key={`${a.policy_id}${a.asset_name}${i}`} label={assetLabel(a)} value={fmtQty(a.quantity, a.decimals)} />)}
+            {tokens.length > 40 ? <Text style={{ color: colors.muted, marginTop: 6 }}>+{tokens.length - 40} more</Text> : null}
+            {tokens.length === 0 ? <Text style={{ color: colors.muted }}>No tokens in this wallet</Text> : null}
+          </Card>
+          <Title>NFTs ({nfts.length} in {groups.length} {groups.length === 1 ? "collection" : "collections"})</Title>
+          <Card>
+            {groups.map((g) => {
+    const single = g.items.length === 1;
+    const isOpen = !!open[g.policy];
+    return <View key={g.policy}>
+                  <Pressable onPress={() => { if (!single) setOpen({ ...open, [g.policy]: !isOpen }); }} style={{ paddingVertical: 9, flexDirection: "row", justifyContent: "space-between", borderBottomColor: colors.border, borderBottomWidth: 1 }}>
+                    <Text style={{ color: colors.text, fontWeight: "700", flexShrink: 1 }}>{g.name}{single ? "" : ` (${g.items.length})`}</Text>
+                    <Text style={{ color: colors.muted }}>{single ? short(g.policy, 5) : isOpen ? "\u25BE" : "\u25B8"}</Text>
+                  </Pressable>
+                  {isOpen ? g.items.slice(0, 60).map((a, i) => <Text key={`${a.asset_name}${i}`} style={{ color: colors.muted, paddingLeft: 14, paddingVertical: 3 }}>{nftLabel(a)}</Text>) : null}
+                  {isOpen && g.items.length > 60 ? <Text style={{ color: colors.muted, paddingLeft: 14 }}>+{g.items.length - 60} more</Text> : null}
+                </View>;
+  })}
+            {groups.length === 0 ? <Text style={{ color: colors.muted }}>No NFTs in this wallet</Text> : null}
           </Card>
           <Pressable onPress={disconnect}><Text style={{ color: colors.danger, textAlign: "center", marginTop: 8 }}>Disconnect</Text></Pressable>
         </>}
@@ -429,15 +665,18 @@ function WalletScreen() {
 function PoolRow({ p, onPress, fav, onFav }) {
   const meta = p.meta_json || {};
   const sat = Number(p.live_saturation || 0);
-  return <Pressable onPress={onPress} style={{ paddingVertical: 10, borderBottomColor: colors.border, borderBottomWidth: 1 }}>
-      <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
-        <Text style={{ color: colors.text, fontWeight: "700", flexShrink: 1 }}>[{meta.ticker ?? "\u2014"}] {meta.name ?? ""}</Text>
-        {onFav ? <Pressable onPress={onFav} hitSlop={12}><Text style={{ color: colors.lime, fontSize: 22 }}>{fav ? "\u2605" : "\u2606"}</Text></Pressable> : null}
+  return <Pressable onPress={onPress} style={{ paddingVertical: 10, borderBottomColor: colors.border, borderBottomWidth: 1, flexDirection: "row" }}>
+      <PoolLogo pool={p} size={44} />
+      <View style={{ flex: 1, marginLeft: 12 }}>
+        <View style={{ flexDirection: "row", justifyContent: "space-between", alignItems: "center" }}>
+          <Text style={{ color: colors.text, fontWeight: "700", flexShrink: 1 }}>[{meta.ticker ?? "\u2014"}] {meta.name ?? ""}</Text>
+          {onFav ? <Pressable onPress={onFav} hitSlop={12}><Text style={{ color: colors.lime, fontSize: 22 }}>{fav ? "\u2605" : "\u2606"}</Text></Pressable> : null}
+        </View>
+        <Text style={{ color: colors.muted, fontSize: 12, marginTop: 2 }}>
+          {human(p.live_stake)} · {p.live_delegators ?? 0} delegators · {p.block_count ?? 0} blocks · sat {sat.toFixed(1)}% · margin {(Number(p.margin || 0) * 100).toFixed(1)}%
+        </Text>
+        <Bar pct={sat} />
       </View>
-      <Text style={{ color: colors.muted, fontSize: 12, marginTop: 2 }}>
-        {human(p.live_stake)} · {p.live_delegators ?? 0} delegators · {p.block_count ?? 0} blocks · sat {sat.toFixed(1)}% · margin {(Number(p.margin || 0) * 100).toFixed(1)}%
-      </Text>
-      <Bar pct={sat} />
     </Pressable>;
 }
 function SimpleRow({ p, onPress }) {
@@ -503,6 +742,153 @@ function ExploreScreen() {
       </Card>
     </Screen>;
 }
+function PriceCards({ refreshKey }) {
+  const { data, error, loading, reload } = useAsync(getPrices, [refreshKey]);
+  useEffect(() => { const t = setInterval(reload, 6e4); return () => clearInterval(t); }, [reload]);
+  return <>
+      <Title>Prices</Title>
+      <Text style={{ color: colors.muted, fontSize: 12, marginBottom: 8 }}>USD · 24h change · refreshes every minute (CoinGecko)</Text>
+      {error && !data ? <ErrorText msg={error} /> : null}
+      {loading && !data ? <Loading /> : null}
+      {(data || []).map((c) => {
+    const ch = c.price_change_percentage_24h;
+    const up = (ch ?? 0) >= 0;
+    return <Card key={c.id}>
+          <View style={{ flexDirection: "row", alignItems: "center" }}>
+            {c.image ? <Image source={{ uri: c.image }} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: "#fff" }} /> : <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.border }} />}
+            <View style={{ marginLeft: 12, flex: 1 }}>
+              <Text style={{ color: colors.text, fontWeight: "800", fontSize: 16 }}>{c.sym}</Text>
+              <Text style={{ color: colors.muted, fontSize: 12 }}>{c.name}{c.market_cap_rank ? ` · #${c.market_cap_rank}` : ""}</Text>
+            </View>
+            <View style={{ alignItems: "flex-end" }}>
+              <Text style={{ color: colors.text, fontWeight: "800", fontSize: 20 }}>{fmtUsd(c.current_price)}</Text>
+              <Text style={{ color: up ? colors.green : colors.danger, fontWeight: "700" }}>{ch == null ? "\u2014" : `${up ? "+" : ""}${ch.toFixed(2)}%`}</Text>
+            </View>
+          </View>
+          <Text style={{ color: colors.muted, fontSize: 12, marginTop: 8 }}>24h range {fmtNum(c.low_24h)} {"\u2013"} {fmtNum(c.high_24h)}</Text>
+        </Card>;
+  })}
+    </>;
+}
+function VoteBar({ yes, no }) {
+  const y = Math.max(0, Math.min(100, Number(yes || 0)));
+  const n = Math.max(0, Math.min(100 - y, Number(no || 0)));
+  return <View style={{ flexDirection: "row", height: 10, borderRadius: 6, overflow: "hidden", backgroundColor: colors.border, marginVertical: 6 }}>
+      <View style={{ width: `${y}%`, backgroundColor: colors.green }} />
+      <View style={{ width: `${n}%`, backgroundColor: colors.danger }} />
+    </View>;
+}
+const statusColor = (st) => st === "Active" ? colors.green : st === "Enacted" || st === "Ratified" ? colors.lime : st === "Dropped" ? colors.danger : colors.muted;
+function Chip({ text, color, active, onPress }) {
+  return <Pressable onPress={onPress} style={{ paddingHorizontal: 12, paddingVertical: 6, borderRadius: 16, borderWidth: 1, borderColor: active ? colors.green : colors.border, backgroundColor: active ? "#16301F" : "transparent", marginRight: 8, marginBottom: 6 }}>
+      <Text style={{ color: color || (active ? colors.green : colors.muted), fontWeight: "700", fontSize: 12 }}>{text}</Text>
+    </Pressable>;
+}
+function GovDetail({ p, curEpoch, onBack }) {
+  const votes = useAsync(() => getVotingSummary(p), [govKey(p)]);
+  const v = votes.data;
+  const st = govStatus(p);
+  const req = govRequested(p);
+  const title = govTitle(p);
+  const abstract = govText(p, "abstract");
+  const motivation = govText(p, "motivation");
+  const rationale = govText(p, "rationale");
+  const left = p.expiration != null && curEpoch != null ? p.expiration - curEpoch : null;
+  const pct = (x) => `${Number(x || 0).toFixed(1)}%`;
+  return <View style={{ flex: 1, backgroundColor: colors.bg }}>
+      <Pressable onPress={onBack} style={{ padding: 16 }}><Text style={{ color: colors.green }}>← Back</Text></Pressable>
+      <Screen onRefresh={votes.reload} refreshing={votes.loading}>
+        <Card>
+          <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+            <Chip text={govTypeLabel(p.proposal_type)} active />
+            <Chip text={st} color={statusColor(st)} />
+          </View>
+          <Text style={{ color: colors.text, fontSize: 18, fontWeight: "800", marginTop: 4 }}>{title || `${govTypeLabel(p.proposal_type)} #${p.proposal_index ?? ""}`}</Text>
+          {abstract ? <Text style={{ color: colors.muted, marginTop: 8 }}>{abstract.slice(0, 700)}{abstract.length > 700 ? "\u2026" : ""}</Text> : null}
+        </Card>
+        {req > 0 ? <Card>
+            <Text style={{ color: colors.muted, fontSize: 12 }}>ADA requested from the treasury</Text>
+            <Text style={{ color: colors.green, fontSize: 28, fontWeight: "800" }}>{fmtAda(req, 0)}</Text>
+            {govWithdrawals(p).map((w, i) => <Row key={i} label={short(w.stake_address || w.stake_addr || "recipient", 8)} value={fmtAda(w.amount, 0)} />)}
+          </Card> : null}
+        <Card>
+          <Row label="Proposed in epoch" value={String(p.proposed_epoch ?? "\u2014")} />
+          <Row label="Expires after epoch" value={String(p.expiration ?? "\u2014")} />
+          {st === "Active" && left != null ? <Row label="Time left" value={left < 0 ? "ending" : `~${left * 5} days (${left} epochs)`} color={colors.lime} /> : null}
+          {p.ratified_epoch != null ? <Row label="Ratified in epoch" value={String(p.ratified_epoch)} /> : null}
+          {p.enacted_epoch != null ? <Row label="Enacted in epoch" value={String(p.enacted_epoch)} /> : null}
+          {p.dropped_epoch != null ? <Row label="Dropped in epoch" value={String(p.dropped_epoch)} /> : null}
+          {p.expired_epoch != null ? <Row label="Expired in epoch" value={String(p.expired_epoch)} /> : null}
+          <Row label="Deposit" value={fmtAda(p.deposit, 0)} />
+        </Card>
+        <Title>Votes</Title>
+        <Card>
+          {votes.loading && !v ? <Loading /> : votes.error ? <Text style={{ color: colors.muted }}>Voting data isn't available right now.</Text> : !v ? <Text style={{ color: colors.muted }}>No votes recorded yet.</Text> : <>
+              <Text style={{ color: colors.text, fontWeight: "700" }}>DReps</Text>
+              <VoteBar yes={v.drep_yes_pct} no={v.drep_no_pct} />
+              <Row label="Yes / No (voting power)" value={`${pct(v.drep_yes_pct)} / ${pct(v.drep_no_pct)}`} />
+              <Row label="Votes cast (yes / no / abstain)" value={`${v.drep_yes_votes_cast ?? 0} / ${v.drep_no_votes_cast ?? 0} / ${v.drep_abstain_votes_cast ?? 0}`} />
+              <Text style={{ color: colors.text, fontWeight: "700", marginTop: 12 }}>Stake pools</Text>
+              <VoteBar yes={v.pool_yes_pct} no={v.pool_no_pct} />
+              <Row label="Yes / No (voting power)" value={`${pct(v.pool_yes_pct)} / ${pct(v.pool_no_pct)}`} />
+              <Row label="Votes cast (yes / no / abstain)" value={`${v.pool_yes_votes_cast ?? 0} / ${v.pool_no_votes_cast ?? 0} / ${v.pool_abstain_votes_cast ?? 0}`} />
+              <Text style={{ color: colors.text, fontWeight: "700", marginTop: 12 }}>Constitutional Committee</Text>
+              <VoteBar yes={v.committee_yes_pct} no={v.committee_no_pct} />
+              <Row label="Yes / No / abstain (votes)" value={`${v.committee_yes_votes_cast ?? 0} / ${v.committee_no_votes_cast ?? 0} / ${v.committee_abstain_votes_cast ?? 0}`} />
+              <Text style={{ color: colors.muted, fontSize: 11, marginTop: 10 }}>Percentages are shares of voting power. The share needed to pass depends on the type of action, so this screen doesn't say whether a proposal will be ratified.</Text>
+            </>}
+        </Card>
+        {motivation ? <><Title>Motivation</Title><Card><Text style={{ color: colors.muted }}>{motivation.slice(0, 900)}{motivation.length > 900 ? "\u2026" : ""}</Text></Card></> : null}
+        {rationale ? <><Title>Rationale</Title><Card><Text style={{ color: colors.muted }}>{rationale.slice(0, 900)}{rationale.length > 900 ? "\u2026" : ""}</Text></Card></> : null}
+        {p.meta_url ? <Text style={{ color: colors.muted, fontSize: 11 }} selectable>Metadata: {p.meta_url}</Text> : null}
+      </Screen>
+    </View>;
+}
+function GovernanceScreen() {
+  const props = useAsync(getProposals);
+  const tip = useAsync(getTip);
+  const [filter, setFilter] = useState("active");
+  const [selected, setSelected] = useState(null);
+  const curEpoch = tip.data ? tip.data.epoch_no : null;
+  const all = props.data || [];
+  const list = all.filter((p) => filter === "all" ? true : filter === "treasury" ? p.proposal_type === "TreasuryWithdrawals" : govStatus(p) === "Active");
+  const activeAsks = all.filter((p) => govStatus(p) === "Active" && p.proposal_type === "TreasuryWithdrawals");
+  const activeTotal = activeAsks.reduce((sum, p) => sum + govRequested(p), 0);
+  if (selected) return <GovDetail p={selected} curEpoch={curEpoch} onBack={() => setSelected(null)} />;
+  return <Screen onRefresh={() => { props.reload(); tip.reload(); }} refreshing={props.loading}>
+      {props.loading && !props.data ? <Loading /> : props.error ? <ErrorText msg={props.error} /> : <>
+          <Card>
+            <Text style={{ color: colors.muted, fontSize: 12 }}>Open treasury requests</Text>
+            <Text style={{ color: colors.green, fontSize: 26, fontWeight: "800" }}>{fmtAda(activeTotal, 0)}</Text>
+            <Text style={{ color: colors.muted, fontSize: 12 }}>{activeAsks.length} active treasury {activeAsks.length === 1 ? "proposal" : "proposals"} · {all.filter((p) => govStatus(p) === "Active").length} active actions in total</Text>
+          </Card>
+          <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+            <Chip text="Active" active={filter === "active"} onPress={() => setFilter("active")} />
+            <Chip text="Treasury" active={filter === "treasury"} onPress={() => setFilter("treasury")} />
+            <Chip text="All" active={filter === "all"} onPress={() => setFilter("all")} />
+          </View>
+          {list.length === 0 ? <Text style={{ color: colors.muted, marginTop: 12 }}>Nothing to show here.</Text> : null}
+          {list.map((p) => {
+    const st = govStatus(p);
+    const req = govRequested(p);
+    const left = p.expiration != null && curEpoch != null ? p.expiration - curEpoch : null;
+    return <Pressable key={govKey(p)} onPress={() => setSelected(p)}>
+              <Card>
+                <View style={{ flexDirection: "row", justifyContent: "space-between" }}>
+                  <Text style={{ color: colors.muted, fontSize: 12 }}>{govTypeLabel(p.proposal_type)}</Text>
+                  <Text style={{ color: statusColor(st), fontSize: 12, fontWeight: "700" }}>{st}</Text>
+                </View>
+                <Text style={{ color: colors.text, fontWeight: "700", fontSize: 15, marginTop: 4 }}>{govTitle(p) || `${govTypeLabel(p.proposal_type)} #${p.proposal_index ?? ""}`}</Text>
+                {req > 0 ? <Text style={{ color: colors.green, fontWeight: "800", fontSize: 18, marginTop: 6 }}>{fmtAda(req, 0)} requested</Text> : null}
+                <Text style={{ color: colors.muted, fontSize: 12, marginTop: 6 }}>
+                  Proposed epoch {p.proposed_epoch ?? "\u2014"}{st === "Active" && left != null ? ` · ~${Math.max(left, 0) * 5} days left` : p.expiration != null ? ` · expires epoch ${p.expiration}` : ""}
+                </Text>
+              </Card>
+            </Pressable>;
+  })}
+        </>}
+    </Screen>;
+}
 class ErrorBoundary extends React.Component {
   constructor(p) { super(p); this.state = { err: null }; }
   static getDerivedStateFromError(e) { return { err: e }; }
@@ -526,10 +912,10 @@ function App() {
   return <ErrorBoundary><NavigationContainer theme={theme}>
       <StatusBar style="light" />
       <Tab.Navigator screenOptions={{ tabBarActiveTintColor: colors.green, tabBarInactiveTintColor: colors.muted, headerStyle: { backgroundColor: colors.card }, headerTintColor: colors.text, tabBarStyle: { backgroundColor: colors.card, borderTopColor: colors.border } }}>
-        <Tab.Screen name="Frogs Pool" component={PoolScreen} options={{ title: "Frogs Pool", tabBarIcon: logoIcon }} />
         <Tab.Screen name="Epoch" component={EpochScreen} options={{ title: "Epoch", tabBarIcon: tabIcon("\u23F3") }} />
         <Tab.Screen name="Wallet" component={WalletScreen} options={{ title: "Wallet", tabBarIcon: tabIcon("\u{1F45B}") }} />
         <Tab.Screen name="Explore" component={ExploreScreen} options={{ title: "Explore", tabBarIcon: tabIcon("\u{1F50E}") }} />
+        <Tab.Screen name="Governance" component={GovernanceScreen} options={{ title: "Governance", tabBarIcon: tabIcon("\u{1F5F3}\uFE0F") }} />
       </Tab.Navigator>
     </NavigationContainer></ErrorBoundary>;
 }

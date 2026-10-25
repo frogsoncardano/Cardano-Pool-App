@@ -1,7 +1,7 @@
 import React from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import { FrogsWidget, FrogsBlocksWidget } from './FrogsWidget';
-import { loadWidgetData, POOL_ID } from './data';
+import { FrogsWidget, PoolMiniWidget, PriceWidget } from './FrogsWidget';
+import { loadWidgetData, loadPrice, POOL_ID } from './data';
 
 const pad = (n) => String(n).padStart(2, '0');
 const clock = () => {
@@ -9,7 +9,10 @@ const clock = () => {
   return pad(t.getHours()) + ':' + pad(t.getMinutes()) + ':' + pad(t.getSeconds());
 };
 
-// The pool shown on the widgets can be changed in the app (Explore > pool > "Use for widget").
+// CoinGecko ids for the price widgets (NIGHT = Midnight)
+const COIN = { FrogsAda: 'cardano', FrogsNight: 'midnight-3', FrogsBtc: 'bitcoin' };
+
+// The pool shown on the pool widgets can be changed in the app (Explore > pool > "Use for widget").
 async function widgetPool() {
   try {
     const saved = JSON.parse(await AsyncStorage.getItem('widget:pool'));
@@ -19,13 +22,23 @@ async function widgetPool() {
 }
 
 async function draw(props) {
-  const small = props.widgetInfo && props.widgetInfo.widgetName === 'FrogsBlocks';
-  const View = small ? FrogsBlocksWidget : FrogsWidget;
+  const name = props.widgetInfo && props.widgetInfo.widgetName;
   try {
-    const d = await loadWidgetData(await widgetPool());
-    props.renderWidget(<View d={d} time={clock()} />);
+    if (COIN[name]) {
+      const d = await loadPrice(COIN[name]);
+      props.renderWidget(<PriceWidget d={d} />);
+    } else if (name === 'FrogsPoolMini') {
+      const d = await loadWidgetData(await widgetPool());
+      props.renderWidget(<PoolMiniWidget d={d} />);
+    } else {
+      const d = await loadWidgetData(await widgetPool());
+      props.renderWidget(<FrogsWidget d={d} time={clock()} />);
+    }
   } catch (e) {
-    props.renderWidget(<View error={String((e && e.message) || e)} time={clock()} />);
+    const msg = String((e && e.message) || e);
+    if (COIN[name]) props.renderWidget(<PriceWidget error={msg} />);
+    else if (name === 'FrogsPoolMini') props.renderWidget(<PoolMiniWidget error={msg} />);
+    else props.renderWidget(<FrogsWidget error={msg} time={clock()} />);
   }
 }
 
