@@ -108,6 +108,7 @@ export async function loadPrice(id) {
       low: fmtNum(row.low_24h),
       high: fmtNum(row.high_24h),
       image: row.image,
+      symbol: String(row.symbol || '').toUpperCase(),
     };
     try { await AsyncStorage.setItem(key, JSON.stringify(d)); } catch (e) {}
     return d;

@@ -1,44 +1,23 @@
-import React from 'react';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import { FrogsWidget, PoolMiniWidget, PriceWidget } from './FrogsWidget';
-import { loadWidgetData, loadPrice, POOL_ID } from './data';
+import { instantView, freshView, errorView } from './render';
 
-const pad = (n) => String(n).padStart(2, '0');
-const clock = () => {
-  const t = new Date();
-  return pad(t.getHours()) + ':' + pad(t.getMinutes()) + ':' + pad(t.getSeconds());
-};
-
-// CoinGecko ids for the price widgets (NIGHT = Midnight)
-const COIN = { FrogsAda: 'cardano', FrogsNight: 'midnight-3', FrogsBtc: 'bitcoin' };
-
-// The pool shown on the pool widgets can be changed in the app (Explore > pool > "Use for widget").
-async function widgetPool() {
-  try {
-    const saved = JSON.parse(await AsyncStorage.getItem('widget:pool'));
-    if (saved && saved.id) return saved.id;
-  } catch (e) {}
-  return POOL_ID;
-}
-
+// Paint something right away (cached data or "Loading…"), then refresh. If the refresh fails and there
+// was cached data, keep showing it; otherwise show the error. A widget is never left blank.
 async function draw(props) {
   const name = props.widgetInfo && props.widgetInfo.widgetName;
+  let hasCache = false;
   try {
-    if (COIN[name]) {
-      const d = await loadPrice(COIN[name]);
-      props.renderWidget(<PriceWidget d={d} />);
-    } else if (name === 'FrogsPoolMini') {
-      const d = await loadWidgetData(await widgetPool());
-      props.renderWidget(<PoolMiniWidget d={d} />);
-    } else {
-      const d = await loadWidgetData(await widgetPool());
-      props.renderWidget(<FrogsWidget d={d} time={clock()} />);
-    }
+    const first = await instantView(name);
+    hasCache = first.hasCache;
+    props.renderWidget(first.element);
+  } catch (e) {}
+  try {
+    props.renderWidget(await freshView(name));
   } catch (e) {
-    const msg = String((e && e.message) || e);
-    if (COIN[name]) props.renderWidget(<PriceWidget error={msg} />);
-    else if (name === 'FrogsPoolMini') props.renderWidget(<PoolMiniWidget error={msg} />);
-    else props.renderWidget(<FrogsWidget error={msg} time={clock()} />);
+    if (!hasCache) {
+      try {
+        props.renderWidget(errorView(name, e));
+      } catch (e2) {}
+    }
   }
 }
 
