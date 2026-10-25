@@ -9,10 +9,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    strategy:
-      fail-fast: false
-      matrix:
-        variant: [core, widgets]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -25,21 +21,13 @@ jobs:
       - name: Create Expo project and copy our files in
         run: |
           npx create-expo-app@latest build --template "${{ inputs.template || 'blank' }}" --no-install --yes
-          cp App.js build/App.js
+          cp App.js index.js app.json build/
           mkdir -p build/assets && cp -r assets/. build/assets/
-          if [ "${{ matrix.variant }}" = "widgets" ]; then
-            cp index.js build/index.js
-            cp app.json build/app.json
-            cp -r widget build/widget
-          else
-            cp index-core.js build/index.js
-            cp app-core.json build/app.json
-          fi
+          cp -r widget build/widget
           cd build
           npm pkg set main=index.js
           npm install
-          npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar
-          if [ "${{ matrix.variant }}" = "widgets" ]; then npx expo install react-native-android-widget; fi
+          npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar react-native-android-widget
       - name: Prebuild native Android project
         working-directory: build
         run: npx expo prebuild --platform android --no-install
@@ -53,5 +41,5 @@ jobs:
         run: ./gradlew assembleRelease --no-daemon
       - uses: actions/upload-artifact@v4
         with:
-          name: frogs-apk-${{ matrix.variant }}
+          name: frog-labs-apk
           path: build/android/app/build/outputs/apk/release/*.apk
