@@ -27,7 +27,7 @@ jobs:
           cd build
           npm pkg set main=index.js
           npm install
-          npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar react-native-android-widget
+          npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar react-native-android-widget expo-notifications expo-task-manager expo-background-task
       - name: Prebuild native Android project
         working-directory: build
         run: npx expo prebuild --platform android --no-install
