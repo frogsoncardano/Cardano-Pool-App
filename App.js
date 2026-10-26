@@ -1,10 +1,12 @@
 import React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, Image, Pressable, RefreshControl, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, AppState, Image, Pressable, RefreshControl, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { NavigationContainer, DarkTheme } from "@react-navigation/native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import AsyncStorage from "@react-native-async-storage/async-storage";
+import { DEFAULT_SETTINGS, loadSettings, saveSettings, runAlertChecks, resetAlertState } from "./alerts/engine";
+import { notify, notificationsAllowed, askNotificationPermission } from "./alerts/notify";
 const POOL_ID = "pool154xmvhp4jnz7phwcla09uvzqnn3ch54lh2yzrt2znxdgc4trp8x";
 const KOIOS_BASE = "https://api.koios.rest/api/v1";
 const KOIOS_TOKEN = "";
@@ -310,6 +312,26 @@ async function getVotingSummary(p) {
   if (last) throw last;
   return null;
 }
+
+// ---------- rewards calculator + pool comparison ----------
+// Average per-epoch reward rate for delegators, from pool_history. Epochs where Koios has no reward data
+// (blocks minted but 0 rewards listed) are skipped; epochs with no blocks count as a real 0.
+function poolRate(hist, curEpoch) {
+  const rows = [...hist || []].filter((e) => curEpoch == null || e.epoch_no <= curEpoch - 2).sort((a, b) => b.epoch_no - a.epoch_no).slice(0, 12);
+  let sum = 0, n = 0, gaps = 0;
+  for (const e of rows) {
+    const rew = rewardOf(e);
+    const stake = Number(e.active_stake || 0);
+    if (!(stake > 0)) continue;
+    if (rew === 0 && (e.block_cnt || 0) > 0) { gaps++; continue; }
+    sum += rew / stake;
+    n++;
+  }
+  return { rate: n ? sum / n : null, epochs: n, gaps };
+}
+const aprOf = (rate) => rate == null ? null : rate * 73 * 100;
+const apyOf = (rate) => rate == null ? null : (Math.pow(1 + rate, 73) - 1) * 100;
+const pct2 = (n) => n == null ? "n/a" : n.toFixed(2) + "%";
 const FAV_KEY = "fav:pools";
 const WIDGET_KEY = "widget:pool";
 async function loadFavs() {
@@ -501,7 +523,8 @@ function PoolDetail({ poolId }) {
 function EpochScreen() {
   const { data, error, loading, reload } = useAsync(async () => {
     const tip2 = await getTip();
-    const ep2 = await getEpoch(tip2.epoch_no);
+    const ep2 = tip2 ? await getEpoch(tip2.epoch_no) : null;
+    if (!tip2 || !ep2) throw new Error("Epoch data is unavailable right now");
     return { tip: tip2, ep: ep2 };
   });
   const [now, setNow] = useState(Date.now() / 1e3);
@@ -691,6 +714,7 @@ function ExploreScreen() {
   const [selected, setSelected] = useState(null);
   const [favs, setFavs] = useState([]);
   const [note, setNote] = useState("");
+  const [mode, setMode] = useState("search");
   const retiring = useAsync(getRetiringPools);
   const results = useAsync(() => dq.trim().length >= 2 ? searchSpos(dq) : Promise.resolve([]), [dq]);
   useEffect(() => { const t = setTimeout(() => setDq(q), 500); return () => clearTimeout(t); }, [q]);
@@ -716,7 +740,15 @@ function ExploreScreen() {
         <PoolDetail poolId={selected.id} />
       </View>;
   const rows = results.data ?? [];
+  const modeChips = <View style={{ flexDirection: "row", flexWrap: "wrap", marginBottom: 6 }}>
+      <Chip text="Search" active={mode === "search"} onPress={() => setMode("search")} />
+      <Chip text="Rewards calculator" active={mode === "calc"} onPress={() => setMode("calc")} />
+      <Chip text="Compare pools" active={mode === "compare"} onPress={() => setMode("compare")} />
+    </View>;
+  if (mode === "calc") return <Screen>{modeChips}<RewardsCalc /></Screen>;
+  if (mode === "compare") return <Screen>{modeChips}<ComparePools /></Screen>;
   return <Screen>
+      {modeChips}
       <TextInput
     value={q}
     onChangeText={setQ}
@@ -889,6 +921,208 @@ function GovernanceScreen() {
         </>}
     </Screen>;
 }
+function PoolPicker({ onPick }) {
+  const [q, setQ] = useState("");
+  const [dq, setDq] = useState("");
+  useEffect(() => { const t = setTimeout(() => setDq(q), 500); return () => clearTimeout(t); }, [q]);
+  const res = useAsync(() => dq.trim().length >= 2 ? searchSpos(dq) : Promise.resolve([]), [dq]);
+  const saved = useAsync(async () => { const f = await loadFavs(); return getPoolInfos(f.map((x) => x.id)); }, []);
+  const rows = res.data || [];
+  return <View>
+      <TextInput value={q} onChangeText={setQ} placeholder="Find a pool: ticker or pool ID" placeholderTextColor={colors.muted} autoCapitalize="none" autoCorrect={false} style={{ color: colors.text, borderColor: colors.border, borderWidth: 1, borderRadius: 10, padding: 12, marginBottom: 8 }} />
+      {dq.trim().length >= 2 ? <Card>{res.loading ? <Loading /> : res.error ? <ErrorText msg={res.error} /> : rows.length === 0 ? <Text style={{ color: colors.muted }}>No pools found</Text> : rows.map((p) => <PoolRow key={p.pool_id_bech32} p={p} onPress={() => onPick(p)} />)}</Card> : null}
+      {(saved.data || []).length > 0 && dq.trim().length < 2 ? <><Title>Saved pools</Title><Card>{saved.data.map((p) => <PoolRow key={p.pool_id_bech32} p={p} onPress={() => onPick(p)} />)}</Card></> : null}
+    </View>;
+}
+function RewardsCalc() {
+  const [pool, setPool] = useState(null);
+  const [amount, setAmount] = useState("10000");
+  const tip = useAsync(getTip);
+  const hist = useAsync(() => pool ? getPoolHistory(pool.pool_id_bech32) : Promise.resolve(null), [pool && pool.pool_id_bech32]);
+  const amt = Number(String(amount).replace(/[^0-9.]/g, "")) || 0;
+  const st = hist.data ? poolRate(hist.data, tip.data && tip.data.epoch_no) : null;
+  const rate = st && st.rate;
+  const meta = pool && pool.meta_json || {};
+  const money = (n) => `${n.toLocaleString("en-US", { maximumFractionDigits: n < 10 ? 2 : 0 })} \u20B3`;
+  return <View>
+      <Title>Rewards calculator</Title>
+      {!pool ? <>
+          <Text style={{ color: colors.muted, marginBottom: 8 }}>Pick a pool to estimate what your ADA could earn there, based on how it actually performed over its last epochs.</Text>
+          <PoolPicker onPick={setPool} />
+        </> : <>
+          <Card>
+            <View style={{ flexDirection: "row", alignItems: "center" }}>
+              <PoolLogo pool={pool} size={44} />
+              <View style={{ marginLeft: 12, flex: 1 }}>
+                <Text style={{ color: colors.text, fontWeight: "800", fontSize: 16 }}>[{meta.ticker ?? "\u2014"}] {meta.name ?? ""}</Text>
+                <Text style={{ color: colors.muted, fontSize: 12 }}>margin {(Number(pool.margin || 0) * 100).toFixed(1)}% · fixed {fmtAda(pool.fixed_cost, 0)}</Text>
+              </View>
+              <Pressable onPress={() => setPool(null)}><Text style={{ color: colors.green }}>Change</Text></Pressable>
+            </View>
+          </Card>
+          <Card>
+            <Text style={{ color: colors.muted, fontSize: 12, marginBottom: 6 }}>Amount to stake (ADA)</Text>
+            <TextInput value={amount} onChangeText={setAmount} keyboardType="numeric" style={{ color: colors.text, borderColor: colors.border, borderWidth: 1, borderRadius: 10, padding: 12, fontSize: 18 }} />
+            <View style={{ flexDirection: "row", marginTop: 8 }}>{["1000", "10000", "100000"].map((v) => <Chip key={v} text={Number(v).toLocaleString("en-US")} active={amount === v} onPress={() => setAmount(v)} />)}</View>
+          </Card>
+          {hist.loading && !hist.data ? <Loading /> : hist.error ? <ErrorText msg={hist.error} /> : rate == null ? <Card><Text style={{ color: colors.muted }}>Not enough reward history for this pool to estimate anything yet.</Text></Card> : <Card>
+              <Row label="Average per epoch (5 days)" value={money(amt * rate)} />
+              <Row label="Per month (~6 epochs)" value={money(amt * rate * 6)} />
+              <Row label="Per year" value={money(amt * rate * 73)} color={colors.green} />
+              <Row label="Per year, reinvested each epoch" value={money(amt * (Math.pow(1 + rate, 73) - 1))} />
+              <Row label="Estimated yearly rate (APR / APY)" value={`${pct2(aprOf(rate))} / ${pct2(apyOf(rate))}`} />
+              <Text style={{ color: colors.muted, fontSize: 11, marginTop: 10 }}>Based on the last {st.epochs} epochs with data{st.gaps ? ` (${st.gaps} skipped because Koios had no reward numbers)` : ""}. Pool fees are already taken out. Rewards arrive about two epochs after they are earned. Small pools depend on block luck, so real results can differ a lot. This is an estimate, not a promise.</Text>
+            </Card>}
+        </>}
+    </View>;
+}
+function ComparePools() {
+  const [picked, setPicked] = useState([]);
+  const [adding, setAdding] = useState(true);
+  const tip = useAsync(getTip);
+  const key = picked.map((p) => p.pool_id_bech32).join(",");
+  const hists = useAsync(() => Promise.all(picked.map((p) => getPoolHistory(p.pool_id_bech32).catch(() => []))), [key]);
+  const epoch = tip.data && tip.data.epoch_no;
+  const stats = picked.map((p, i) => hists.data && hists.data[i] ? poolRate(hists.data[i], epoch) : { rate: null, epochs: 0, gaps: 0 });
+  // each metric: how to show it, and which value wins ("hi" = higher is better, "lo" = lower is better)
+  const metrics = [
+    { label: "Live stake", val: (p) => Number(p.live_stake || 0), fmt: (v) => human(v), win: null },
+    { label: "Saturation", val: (p) => Number(p.live_saturation || 0), fmt: (v) => v.toFixed(1) + "%", win: "lo" },
+    { label: "Delegators", val: (p) => Number(p.live_delegators || 0), fmt: (v) => String(v), win: null },
+    { label: "Lifetime blocks", val: (p) => Number(p.block_count || 0), fmt: (v) => String(v), win: "hi" },
+    { label: "Margin", val: (p) => Number(p.margin || 0) * 100, fmt: (v) => v.toFixed(2) + "%", win: "lo" },
+    { label: "Fixed cost / epoch", val: (p) => ada(p.fixed_cost), fmt: (v) => v.toFixed(0) + " \u20B3", win: "lo" },
+    { label: "Pledge", val: (p) => ada(p.pledge), fmt: (v) => v.toLocaleString("en-US", { maximumFractionDigits: 0 }) + " \u20B3", win: "hi" },
+    { label: "Est. yearly rate (APR)", val: (p, i) => aprOf(stats[i].rate), fmt: (v) => pct2(v), win: "hi" },
+  ];
+  const best = (m) => {
+    if (!m.win || picked.length < 2) return -1;
+    const vals = picked.map((p, i) => m.val(p, i));
+    const ok = vals.filter((v) => v != null);
+    if (ok.length < 2) return -1;
+    const target = m.win === "hi" ? Math.max(...ok) : Math.min(...ok);
+    if (ok.every((v) => v === target)) return -1;
+    return vals.indexOf(target);
+  };
+  return <View>
+      <Title>Compare pools</Title>
+      {picked.length === 0 ? <Text style={{ color: colors.muted, marginBottom: 8 }}>Pick 2 or 3 pools to see them side by side. The best value in each row is highlighted.</Text> : null}
+      {picked.length > 0 ? <Card>
+          <View style={{ flexDirection: "row" }}>
+            <View style={{ width: 96 }} />
+            {picked.map((p, i) => <View key={p.pool_id_bech32} style={{ flex: 1, alignItems: "center" }}>
+                <PoolLogo pool={p} size={36} />
+                <Text style={{ color: colors.text, fontWeight: "800", marginTop: 4 }}>{p.meta_json && p.meta_json.ticker || "?"}</Text>
+                <Pressable onPress={() => setPicked(picked.filter((x) => x !== p))} hitSlop={8}><Text style={{ color: colors.muted, fontSize: 11 }}>remove ✕</Text></Pressable>
+              </View>)}
+          </View>
+          {metrics.map((m) => {
+    const b = best(m);
+    return <View key={m.label} style={{ flexDirection: "row", paddingVertical: 8, borderTopColor: colors.border, borderTopWidth: 1, alignItems: "center" }}>
+                <Text style={{ width: 96, color: colors.muted, fontSize: 11 }}>{m.label}</Text>
+                {picked.map((p, i) => {
+      const v = m.val(p, i);
+      return <Text key={p.pool_id_bech32} style={{ flex: 1, textAlign: "center", fontWeight: b === i ? "800" : "600", color: b === i ? colors.lime : colors.text, fontSize: 13 }}>{v == null ? "n/a" : m.fmt(v)}{b === i ? " \u25B2" : ""}</Text>;
+    })}
+              </View>;
+  })}
+          {hists.loading ? <Text style={{ color: colors.muted, fontSize: 11, marginTop: 8 }}>Loading reward history…</Text> : <Text style={{ color: colors.muted, fontSize: 11, marginTop: 8 }}>Yearly rate is an estimate from each pool's last epochs ({stats.map((x) => x.epochs).join(" / ")} epochs counted). Block luck makes small pools swing a lot. ▲ marks the best value per row; it isn't advice.</Text>}
+        </Card> : null}
+      {picked.length < 3 ? <>
+          {picked.length > 0 && !adding ? <Pressable onPress={() => setAdding(true)}><Text style={{ color: colors.green, marginBottom: 8 }}>+ Add another pool</Text></Pressable> : null}
+          {adding || picked.length === 0 ? <PoolPicker onPick={(p) => { if (!picked.some((x) => x.pool_id_bech32 === p.pool_id_bech32)) setPicked([...picked, p]); setAdding(false); }} /> : null}
+        </> : null}
+    </View>;
+}
+const ALERT_ITEMS = [
+  { key: "proposals", title: "New governance proposals", text: "A new governance action appears, with the ADA it asks for if it's a treasury withdrawal." },
+  { key: "blocks", title: "Blocks minted by your pools", text: "Pools you saved with \u2605 in Explore minted a new block." },
+  { key: "poolHealth", title: "Pool changes", text: "Saved pools change their fees, announce retirement, or get close to saturation (95%+)." },
+  { key: "rewards", title: "Staking rewards", text: "Your connected wallet receives rewards for a new epoch." },
+  { key: "priceMoves", title: "Big price moves", text: "ADA, BTC or NIGHT moves 10% or more in 24 hours." },
+];
+function AlertsScreen() {
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [allowed, setAllowed] = useState(null);
+  const [favs, setFavs] = useState([]);
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const refresh = useCallback(async () => {
+    setSettings(await loadSettings());
+    setAllowed(await notificationsAllowed());
+    setFavs(await loadFavs());
+  }, []);
+  useEffect(() => { refresh(); const t = setInterval(refresh, 5e3); return () => clearInterval(t); }, [refresh]);
+  async function toggle(key, value) {
+    const next = { ...settings, [key]: value };
+    setSettings(next);
+    await saveSettings(next);
+    if (value && !allowed) setAllowed(await askNotificationPermission());
+  }
+  async function allow() { setAllowed(await askNotificationPermission()); }
+  async function test() {
+    setMsg("");
+    try { await notify("Frog Labs", "Notifications are working \u{1F438}", "general"); setMsg(allowed ? "Test sent. Check your notification shade." : "Sent, but notifications are not allowed yet. Tap \"Allow notifications\"."); } catch (e) { setMsg("Could not send: " + e.message); }
+  }
+  async function checkNow() {
+    setBusy(true);
+    setMsg("");
+    try {
+      const r = await runAlertChecks({ notify, force: true });
+      setMsg(r.skipped ? "Another check is running, try again in a moment." : r.fired.length ? `${r.fired.length} new ${r.fired.length === 1 ? "alert" : "alerts"} sent.` : "Checked. Nothing new since the last check.");
+    } catch (e) { setMsg("Check failed: " + e.message); }
+    setBusy(false);
+  }
+  async function resetAll() { await resetAlertState(); setMsg("Reset. The next check starts fresh and won't notify about old items."); }
+  return <Screen>
+      {allowed === false ? <Card style={{ borderColor: colors.warn }}>
+          <Text style={{ color: colors.warn, fontWeight: "700" }}>Notifications are off</Text>
+          <Text style={{ color: colors.muted, marginVertical: 6 }}>Allow notifications so Frog Labs can alert you.</Text>
+          <Pressable onPress={allow} style={{ backgroundColor: colors.green, borderRadius: 10, padding: 10 }}><Text style={{ textAlign: "center", fontWeight: "800", color: "#04210F" }}>Allow notifications</Text></Pressable>
+        </Card> : null}
+      <Card>
+        {ALERT_ITEMS.map((it) => <View key={it.key} style={{ flexDirection: "row", alignItems: "center", paddingVertical: 8 }}>
+            <View style={{ flex: 1, paddingRight: 10 }}>
+              <Text style={{ color: colors.text, fontWeight: "700" }}>{it.title}</Text>
+              <Text style={{ color: colors.muted, fontSize: 12 }}>{it.text}</Text>
+            </View>
+            <Switch value={!!settings[it.key]} onValueChange={(v) => toggle(it.key, v)} trackColor={{ true: colors.green, false: colors.border }} thumbColor="#ECFDF5" />
+          </View>)}
+      </Card>
+      <Title>Watched pools</Title>
+      <Card>
+        {favs.length === 0 ? <Text style={{ color: colors.muted }}>No saved pools yet. In Explore, search for a pool, open it and tap ☆ Save. Block and pool-change alerts use these pools.</Text> : favs.map((f) => <Row key={f.id} label={`[${f.ticker || "?"}]`} value={short(f.id, 8)} />)}
+      </Card>
+      <Title>Tools</Title>
+      <Card>
+        <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+          <Chip text="Send test notification" active onPress={test} />
+          <Chip text={busy ? "Checking\u2026" : "Check now"} active onPress={checkNow} />
+          <Chip text="Reset" onPress={resetAll} />
+        </View>
+        {msg ? <Text style={{ color: colors.lime, marginTop: 8 }}>{msg}</Text> : null}
+      </Card>
+      <Text style={{ color: colors.muted, fontSize: 11, lineHeight: 16 }}>How it works: Frog Labs checks the chain every minute while the app is open, and in the background about every 15 minutes or more. Android decides the exact timing, and battery savers can delay it. If alerts arrive late or not at all, set Frog Labs to "No restrictions" in battery settings and allow autostart. This is not an instant server push, so a block can reach you minutes after it was minted.</Text>
+    </Screen>;
+}
+function useForegroundAlerts() {
+  useEffect(() => {
+    let alive = true;
+    const run = () => { if (alive) runAlertChecks({ notify, minGapMs: 45e3 }).catch(() => {}); };
+    (async () => {
+      try {
+        if (!(await AsyncStorage.getItem("alerts:asked"))) {
+          await AsyncStorage.setItem("alerts:asked", "1");
+          await askNotificationPermission();
+        }
+      } catch (e) {}
+    })();
+    const t0 = setTimeout(run, 4e3);
+    const t = setInterval(run, 6e4);
+    const sub = AppState.addEventListener("change", (s) => { if (s === "active") run(); });
+    return () => { alive = false; clearTimeout(t0); clearInterval(t); sub.remove(); };
+  }, []);
+}
 class ErrorBoundary extends React.Component {
   constructor(p) { super(p); this.state = { err: null }; }
   static getDerivedStateFromError(e) { return { err: e }; }
@@ -909,6 +1143,7 @@ const Tab = createBottomTabNavigator();
 const tabIcon = (emoji) => ({ focused }) => <Text style={{ fontSize: 20, opacity: focused ? 1 : 0.5 }}>{emoji}</Text>;
 const theme = { ...DarkTheme, colors: { ...DarkTheme.colors, background: colors.bg, card: colors.card, border: colors.border, primary: colors.green, text: colors.text } };
 function App() {
+  useForegroundAlerts();
   return <ErrorBoundary><NavigationContainer theme={theme}>
       <StatusBar style="light" />
       <Tab.Navigator screenOptions={{ tabBarActiveTintColor: colors.green, tabBarInactiveTintColor: colors.muted, headerStyle: { backgroundColor: colors.card }, headerTintColor: colors.text, tabBarStyle: { backgroundColor: colors.card, borderTopColor: colors.border } }}>
@@ -916,6 +1151,7 @@ function App() {
         <Tab.Screen name="Wallet" component={WalletScreen} options={{ title: "Wallet", tabBarIcon: tabIcon("\u{1F45B}") }} />
         <Tab.Screen name="Explore" component={ExploreScreen} options={{ title: "Explore", tabBarIcon: tabIcon("\u{1F50E}") }} />
         <Tab.Screen name="Governance" component={GovernanceScreen} options={{ title: "Governance", tabBarIcon: tabIcon("\u{1F5F3}\uFE0F") }} />
+        <Tab.Screen name="Alerts" component={AlertsScreen} options={{ title: "Alerts", tabBarIcon: tabIcon("\u{1F514}") }} />
       </Tab.Navigator>
     </NavigationContainer></ErrorBoundary>;
 }
