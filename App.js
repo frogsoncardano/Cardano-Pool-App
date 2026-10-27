@@ -41,7 +41,9 @@ const getTip = () => get("/tip").then((r) => r[0]);
 const getEpoch = (n) => get(`/epoch_info?_epoch_no=${n}`).then((r) => r[0]);
 const getPoolInfo = (id) => post("/pool_info", { _pool_bech32_ids: [id] }).then((r) => r[0]);
 const getPoolHistory = (id) => get(`/pool_history?_pool_bech32=${id}`);
-const getPoolBlocks = (id) => get(`/pool_blocks?_pool_bech32=${id}`);
+// pool_blocks with no filters returns the pool's OLDEST blocks (Koios caps it at 1000 rows), so always ask for what we need.
+const getPoolBlocksRecent = (id, n = 15) => get(`/pool_blocks?_pool_bech32=${id}&order=block_height.desc&limit=${n}`);
+const getPoolBlocksEpoch = (id, epoch) => get(`/pool_blocks?_pool_bech32=${id}&_epoch_no=${epoch}`);
 const getDelegators = (id) => get(`/pool_delegators?_pool_bech32=${id}`);
 const getRetiringPools = () => get("/pool_list?pool_status=eq.retiring&order=retiring_epoch.asc&limit=50");
 const searchPools = (q) => get(`/pool_list?ticker=ilike.*${encodeURIComponent(q)}*&limit=30`);
@@ -401,9 +403,10 @@ const rewardOf = (e) => {
 function PoolDetail({ poolId }) {
   const info = useAsync(() => getPoolInfo(poolId), [poolId]);
   const hist = useAsync(() => getPoolHistory(poolId), [poolId]);
-  const blocks = useAsync(() => getPoolBlocks(poolId), [poolId]);
+  const blocks = useAsync(() => getPoolBlocksRecent(poolId, 15), [poolId]);
   const dels = useAsync(() => getDelegators(poolId), [poolId]);
   const tip = useAsync(() => getTip(), []);
+  const epochBlocksData = useAsync(() => tip.data ? getPoolBlocksEpoch(poolId, tip.data.epoch_no) : Promise.resolve(null), [poolId, tip.data]);
   // Koios' pool_history is a cache and some epochs can come back with 0 rewards. Re-ask for those epochs one by one.
   const repair = useAsync(async () => {
     const rows = hist.data || [];
@@ -426,6 +429,7 @@ function PoolDetail({ poolId }) {
     info.reload();
     hist.reload();
     blocks.reload();
+    epochBlocksData.reload();
     dels.reload();
   };
   if (info.loading && !info.data) return <Loading />;
@@ -438,7 +442,7 @@ function PoolDetail({ poolId }) {
   const topDelegators = [...dels.data ?? []].sort((a, b) => Number(b.amount) - Number(a.amount));
   const sat = Number(p.live_saturation ?? 0);
   const curEpoch = tip.data ? tip.data.epoch_no : null;
-  const epochBlocks = curEpoch != null ? recentBlocks.filter((b) => b.epoch_no === curEpoch).length : null;
+  const epochBlocks = epochBlocksData.data ? epochBlocksData.data.length : null;
   const lastBlock = recentBlocks[0];
   const meta = p.meta_json ?? {};
   return <Screen onRefresh={reload} refreshing={info.loading}>
@@ -514,7 +518,7 @@ function PoolDetail({ poolId }) {
         {!blocks.loading && recentBlocks.length === 0 && <Text style={{ color: colors.muted }}>No blocks yet</Text>}
       </Card>
 
-      <Title>Top delegators ({topDelegators.length})</Title>
+      <Title>Top delegators ({p.live_delegators ?? topDelegators.length})</Title>
       <Card>
         {dels.loading ? <Loading /> : topDelegators.slice(0, 25).map((d) => <Row key={d.stake_address} label={short(d.stake_address, 8)} value={`${ada(d.amount).toLocaleString("en-US", { maximumFractionDigits: 0 })} \u20B3`} />)}
       </Card>

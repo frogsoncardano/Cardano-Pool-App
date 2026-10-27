@@ -96,21 +96,30 @@ async function checkProposals(state, fire) {
   state.proposals = { init: true, seen: [...new Set([...rows.map(proposalId), ...prev.seen])].slice(0, 300) };
 }
 
-async function checkBlocks(state, fire, pools) {
+// Koios' pool_blocks with no filters returns a pool's OLDEST blocks (capped at 1000 rows), not its newest.
+// So we never read the whole list: we remember the highest block height we have seen for each pool and
+// ask only for blocks above it. The first time we see a pool we just record its latest height (no alert).
+async function checkBlocks(state, fire, pools, now) {
   state.blocks = state.blocks || {};
   for (const pool of pools) {
-    const rows = await jget(`${KOIOS}/pool_blocks?_pool_bech32=${pool.id}`);
     const prev = state.blocks[pool.id];
-    const seen = new Set(prev ? prev.seen : []);
-    if (prev) {
-      const fresh = rows.filter((b) => !seen.has(b.block_hash)).sort((a, b) => a.block_height - b.block_height);
-      if (fresh.length > 3) {
-        await fire('blocks', `${pool.ticker || 'Your pool'} minted ${fresh.length} blocks`, `Latest: block #${fresh[fresh.length - 1].block_height}`);
-      } else {
-        for (const b of fresh) await fire('blocks', `${pool.ticker || 'Your pool'} minted a block`, `Block #${b.block_height} \u00B7 epoch ${b.epoch_no}`);
-      }
+    if (!prev || typeof prev.height !== 'number') {
+      const latest = await jget(`${KOIOS}/pool_blocks?_pool_bech32=${pool.id}&order=block_height.desc&limit=1`);
+      state.blocks[pool.id] = { height: latest && latest[0] ? Number(latest[0].block_height) : 0 };
+      continue;
     }
-    state.blocks[pool.id] = { seen: [...new Set([...rows.map((b) => b.block_hash), ...(prev ? prev.seen : [])])].slice(0, 80) };
+    const rows = await jget(`${KOIOS}/pool_blocks?_pool_bech32=${pool.id}&block_height=gt.${prev.height}&order=block_height.asc&limit=100`);
+    if (!rows || !rows.length) continue;
+    const top = Math.max(...rows.map((b) => Number(b.block_height)));
+    // safety net: only announce blocks from the last 3 days, even if the server ever returns older ones
+    const fresh = rows.filter((b) => Number(b.block_time) > now / 1000 - 3 * 86400);
+    const name = pool.ticker || 'Your pool';
+    if (fresh.length > 3) {
+      await fire('blocks', `${name} minted ${fresh.length} blocks`, `Latest: block #${top}`);
+    } else {
+      for (const b of fresh) await fire('blocks', `${name} minted a block`, `Block #${b.block_height} \u00B7 epoch ${b.epoch_no}`);
+    }
+    state.blocks[pool.id] = { height: top };
   }
 }
 
@@ -197,7 +206,7 @@ export async function runAlertChecks({ notify, minGapMs = 4 * 60e3, force = fals
       } catch (e) { /* try again next time */ }
     };
     await run('proposals', settings.proposals, () => checkProposals(state, fire));
-    await run('blocks', settings.blocks && pools.length > 0, () => checkBlocks(state, fire, pools));
+    await run('blocks', settings.blocks && pools.length > 0, () => checkBlocks(state, fire, pools, now));
     await run('poolHealth', settings.poolHealth && pools.length > 0, () => checkPoolHealth(state, fire, pools));
     await run('rewards', settings.rewards, () => checkRewards(state, fire));
     await run('priceMoves', settings.priceMoves, () => checkPriceMoves(state, fire, now));
