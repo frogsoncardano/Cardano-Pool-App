@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getPrices } from '../prices';
 
 // Alert engine: compares what Koios / CoinGecko say now with what we saw last time, and calls notify()
 // for anything new. It runs when the app is open (every minute), in the background (Android decides,
@@ -167,7 +168,7 @@ async function checkRewards(state, fire) {
 }
 
 async function checkPriceMoves(state, fire, now) {
-  const rows = await jget(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${COINS.map((c) => c.id).join(',')}&price_change_percentage=24h`);
+  const { rows } = await getPrices({ maxAgeMs: 10 * 60e3 });
   state.prices = state.prices || {};
   for (const c of COINS) {
     const row = rows.find((x) => x.id === c.id);

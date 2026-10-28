@@ -16,3 +16,15 @@ Alerts (Alerts tab): new governance proposals, blocks minted by saved pools, poo
 They run every minute while the app is open, and in the background roughly every 15+ minutes (Android decides; battery savers
 can delay). On Xiaomi/MIUI set Frog Labs to "No restrictions" in battery settings and allow autostart.
 Tools in Explore: rewards calculator and pool comparison.
+
+Wallet actions (stake to a pool, delegate voting power, withdraw rewards)
+------------------------------------------------------------------------
+Users sign in THEIR OWN wallet; Frog Labs never sees keys. The signing page is a small web app in /web.
+1. Upload everything in this folder to your GitHub repo (both .github/workflows files and the web folder).
+2. Repo > Settings > Pages > "Build and deployment" > Source: GitHub Actions.
+   (GitHub Pages on a PRIVATE repo needs a paid GitHub plan. On the free plan make the repo public - it holds no secrets -
+   or download the "frog-labs-web" artifact from the deploy run and drag it onto Netlify Drop / Cloudflare Pages.)
+3. Actions > "Deploy web app (wallet actions)" > Run workflow. When it is green, the run page shows the site address.
+4. Put that address into config.js (DAPP_URL, keep the trailing slash), then run "Build Android APK" again.
+Users open the link inside their wallet's built-in browser (Eternl, Vespr, Begin ...) or in a desktop browser with a wallet extension.
+Try it on a test network (preprod) wallet, or with a small amount on mainnet, before announcing it.

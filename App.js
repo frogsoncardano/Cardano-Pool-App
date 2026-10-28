@@ -1,12 +1,15 @@
 import React from "react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ActivityIndicator, AppState, Image, Pressable, RefreshControl, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
+import { ActivityIndicator, Alert, AppState, Image, Linking, Pressable, RefreshControl, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { StatusBar } from "expo-status-bar";
 import { NavigationContainer, DarkTheme } from "@react-navigation/native";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, runAlertChecks, resetAlertState } from "./alerts/engine";
 import { notify, notificationsAllowed, askNotificationPermission } from "./alerts/notify";
+import * as Clipboard from "expo-clipboard";
+import { DAPP_URL } from "./config";
+import { getPrices, readCachedPrices } from "./prices";
 const POOL_ID = "pool154xmvhp4jnz7phwcla09uvzqnn3ch54lh2yzrt2znxdgc4trp8x";
 const KOIOS_BASE = "https://api.koios.rest/api/v1";
 const KOIOS_TOKEN = "";
@@ -171,11 +174,6 @@ async function searchSpos(q) {
 const getLatestBlocks = (n = 15) => get(`/blocks?order=block_height.desc&limit=${n}`);
 
 // ---------- prices (CoinGecko, no key needed) ----------
-const COINS = [
-  { id: "bitcoin", sym: "BTC", name: "Bitcoin" },
-  { id: "cardano", sym: "ADA", name: "Cardano" },
-  { id: "midnight-3", sym: "NIGHT", name: "Midnight" },
-];
 const fmtNum = (n) => {
   if (n == null) return "\u2014";
   if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 0 });
@@ -184,12 +182,6 @@ const fmtNum = (n) => {
   return n.toFixed(4);
 };
 const fmtUsd = (n) => n == null ? "\u2014" : "$" + fmtNum(n);
-async function getPrices() {
-  const r = await fetch(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=${COINS.map((c) => c.id).join(",")}&price_change_percentage=24h`);
-  if (!r.ok) throw new Error("CoinGecko " + r.status);
-  const rows = await r.json();
-  return COINS.map((c) => ({ ...c, ...(rows.find((x) => x.id === c.id) || {}) }));
-}
 // ---------- pool logos (CIP-6 extended metadata) ----------
 const logoCache = {};
 const fixUrl = (u) => !u ? null : u.startsWith("ipfs://") ? "https://ipfs.io/ipfs/" + u.slice(7).replace(/^ipfs\//, "") : u.replace(/^http:/, "https:");
@@ -334,6 +326,25 @@ function poolRate(hist, curEpoch) {
 const aprOf = (rate) => rate == null ? null : rate * 73 * 100;
 const apyOf = (rate) => rate == null ? null : (Math.pow(1 + rate, 73) - 1) * 100;
 const pct2 = (n) => n == null ? "n/a" : n.toFixed(2) + "%";
+
+// ---------- wallet actions (signed in the user's own wallet through the Frog Labs web app) ----------
+function openWalletAction(params) {
+  if (DAPP_URL.includes("YOUR-GITHUB-USERNAME")) {
+    Alert.alert("Not set up yet", "Wallet actions need the Frog Labs web app. Set DAPP_URL in config.js after deploying it.");
+    return;
+  }
+  const query = Object.keys(params).map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(params[k])}`).join("&");
+  const url = `${DAPP_URL}?${query}`;
+  Alert.alert(
+    "Continue in your wallet",
+    "Cardano wallets sign transactions in their own browser. Copy this link and open it in your wallet's built-in browser (Eternl, Vespr, Begin and others have one). Frog Labs never sees your keys.",
+    [
+      { text: "Copy link", onPress: () => { Clipboard.setStringAsync(url).catch(() => {}); } },
+      { text: "Open here", onPress: () => Linking.openURL(url).catch(() => {}) },
+      { text: "Cancel", style: "cancel" },
+    ]
+  );
+}
 const FAV_KEY = "fav:pools";
 const WIDGET_KEY = "widget:pool";
 async function loadFavs() {
@@ -486,6 +497,9 @@ function PoolDetail({ poolId }) {
         {meta.homepage ? <Row label="Website" value={meta.homepage} /> : null}
       </Card>
 
+      <Pressable onPress={() => openWalletAction({ action: "pool", pool: poolId })} style={{ backgroundColor: colors.green, borderRadius: 12, padding: 14, marginBottom: 12 }}>
+        <Text style={{ textAlign: "center", fontWeight: "800", color: "#04210F" }}>Stake with your wallet</Text>
+      </Pressable>
       <Title>Epoch history</Title>
       <Card>
         {hist.loading ? <Loading /> : lastEpochs.map((e) => {
@@ -657,6 +671,10 @@ function WalletScreen() {
             <Row label="Rewards available" value={fmtAda(acc?.rewards_available, 2)} />
             <Row label="Withdrawn" value={fmtAda(acc?.withdrawals_sum, 2)} />
           </Card>
+          <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+            <Chip text="Withdraw rewards" active onPress={() => openWalletAction({ action: "withdraw" })} />
+            <Chip text="Voting power" active onPress={() => openWalletAction({ action: "drep" })} />
+          </View>
           <Title>Rewards (last 6 epochs)</Title>
           <Card>
             {recentRewards.map((r, i) => <Row key={i} label={`Epoch ${r.earned_epoch} (${r.type})`} value={`+${ada(r.amount).toFixed(2)} \u20B3`} />)}
@@ -779,19 +797,33 @@ function ExploreScreen() {
     </Screen>;
 }
 function PriceCards({ refreshKey }) {
-  const { data, error, loading, reload } = useAsync(getPrices, [refreshKey]);
-  useEffect(() => { const t = setInterval(reload, 6e4); return () => clearInterval(t); }, [reload]);
+  const [state, setState] = useState({ rows: null, at: null, stale: false, failed: false });
+  const load = useCallback(async (force) => {
+    try {
+      const r = await getPrices({ force });
+      setState({ rows: r.rows, at: r.at, stale: r.stale, failed: false });
+    } catch (e) {
+      setState((s) => ({ ...s, failed: !s.rows }));
+    }
+  }, []);
+  // show whatever we already know right away, then refresh in the background
+  useEffect(() => { readCachedPrices().then((c) => { if (c) setState((s) => s.rows ? s : { rows: c.rows, at: c.at, stale: true, failed: false }); }); }, []);
+  useEffect(() => { load(refreshKey > 0); }, [refreshKey, load]);
+  useEffect(() => { const t = setInterval(() => load(false), 18e4); return () => clearInterval(t); }, [load]);
+  const [tick, setTick] = useState(0);
+  useEffect(() => { const t = setInterval(() => setTick((x) => x + 1), 3e4); return () => clearInterval(t); }, []);
+  const ageMin = state.at ? Math.floor((Date.now() - state.at) / 6e4) : 0;
   return <>
       <Title>Prices</Title>
-      <Text style={{ color: colors.muted, fontSize: 12, marginBottom: 8 }}>USD · 24h change · refreshes every minute (CoinGecko)</Text>
-      {error && !data ? <ErrorText msg={error} /> : null}
-      {loading && !data ? <Loading /> : null}
-      {(data || []).map((c) => {
+      <Text style={{ color: colors.muted, fontSize: 12, marginBottom: 8 }}>USD · 24h change{state.rows && ageMin >= 5 ? ` · last updated ${ageMin} min ago` : ""}</Text>
+      {!state.rows && !state.failed ? <Loading /> : null}
+      {!state.rows && state.failed ? <Card><Text style={{ color: colors.muted }}>Prices couldn't be loaded yet. Pull down to try again.</Text></Card> : null}
+      {(state.rows || []).map((c) => {
     const ch = c.price_change_percentage_24h;
     const up = (ch ?? 0) >= 0;
     return <Card key={c.id}>
           <View style={{ flexDirection: "row", alignItems: "center" }}>
-            {c.image ? <Image source={{ uri: c.image }} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: "#fff" }} /> : <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.border }} />}
+            {c.image ? <Image source={{ uri: c.image }} style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: "#fff" }} /> : <View style={{ width: 40, height: 40, borderRadius: 20, backgroundColor: colors.border, alignItems: "center", justifyContent: "center" }}><Text style={{ color: colors.green, fontWeight: "800", fontSize: 12 }}>{c.sym}</Text></View>}
             <View style={{ marginLeft: 12, flex: 1 }}>
               <Text style={{ color: colors.text, fontWeight: "800", fontSize: 16 }}>{c.sym}</Text>
               <Text style={{ color: colors.muted, fontSize: 12 }}>{c.name}{c.market_cap_rank ? ` · #${c.market_cap_rank}` : ""}</Text>
@@ -898,6 +930,9 @@ function GovernanceScreen() {
             <Text style={{ color: colors.green, fontSize: 26, fontWeight: "800" }}>{fmtAda(activeTotal, 0)}</Text>
             <Text style={{ color: colors.muted, fontSize: 12 }}>{activeAsks.length} active treasury {activeAsks.length === 1 ? "proposal" : "proposals"} · {all.filter((p) => govStatus(p) === "Active").length} active actions in total</Text>
           </Card>
+          <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+            <Chip text={"\u{1F5F3}\uFE0F Delegate my voting power"} active onPress={() => openWalletAction({ action: "drep" })} />
+          </View>
           <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
             <Chip text="Active" active={filter === "active"} onPress={() => setFilter("active")} />
             <Chip text="Treasury" active={filter === "treasury"} onPress={() => setFilter("treasury")} />

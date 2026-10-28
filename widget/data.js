@@ -1,4 +1,5 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { getPrices } from '../prices';
 const BASE = 'https://api.koios.rest/api/v1';
 export const POOL_ID = 'pool154xmvhp4jnz7phwcla09uvzqnn3ch54lh2yzrt2znxdgc4trp8x';
 export const TICKER = 'LEAP';
@@ -93,30 +94,20 @@ const fmtNum = (n) => {
   return n.toFixed(4);
 };
 
-// Price + 24h change for one CoinGecko coin id. Falls back to the last good value if the request fails.
+// Price + 24h change for one coin (CoinGecko id). Uses the shared price cache so several widgets
+// and the app together send very few requests, and falls back to the last known price on trouble.
 export async function loadPrice(id) {
-  const key = 'price:' + id;
-  try {
-    const r = await fetch('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=' + id + '&price_change_percentage=24h');
-    if (!r.ok) throw new Error('CoinGecko ' + r.status);
-    const row = (await r.json())[0];
-    if (!row) throw new Error('No data for ' + id);
-    const d = {
-      price: '$' + fmtNum(row.current_price),
-      change: row.price_change_percentage_24h == null ? 0 : row.price_change_percentage_24h,
-      rank: row.market_cap_rank,
-      low: fmtNum(row.low_24h),
-      high: fmtNum(row.high_24h),
-      image: row.image,
-      symbol: String(row.symbol || '').toUpperCase(),
-    };
-    try { await AsyncStorage.setItem(key, JSON.stringify(d)); } catch (e) {}
-    return d;
-  } catch (err) {
-    try {
-      const cached = JSON.parse(await AsyncStorage.getItem(key));
-      if (cached) return { ...cached, stale: true };
-    } catch (e) {}
-    throw err;
-  }
+  const { rows, stale } = await getPrices();
+  const row = rows.find((r) => r.id === id);
+  if (!row || row.current_price == null) throw new Error('No price yet');
+  return {
+    price: '$' + fmtNum(row.current_price),
+    change: row.price_change_percentage_24h == null ? 0 : row.price_change_percentage_24h,
+    rank: row.market_cap_rank,
+    low: fmtNum(row.low_24h),
+    high: fmtNum(row.high_24h),
+    image: row.image,
+    symbol: row.sym,
+    stale,
+  };
 }
