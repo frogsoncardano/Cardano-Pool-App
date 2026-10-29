@@ -2,4 +2,4 @@
 // After the "Deploy web app" workflow finishes, GitHub shows the address; it looks like
 //   https://YOUR-GITHUB-USERNAME.github.io/YOUR-REPO-NAME/
 // Replace the text below with it (keep the trailing slash), then rebuild the app.
-export const DAPP_URL = 'https://YOUR-GITHUB-USERNAME.github.io/Cardano-Pool-App/';
+export const DAPP_URL = 'https://frogsoncardano.github.io/Cardano-Pool-App/';
