@@ -23,18 +23,18 @@ jobs:
           missing=0
           for f in App.js index.js app.json assets/icon.png assets/adaptive-icon.png assets/notification-icon.png \
                    widget/render.js widget/task-handler.js widget/FrogsWidget.js widget/data.js widget/logo.js widget/refresh.js \
-                   alerts/engine.js alerts/notify.js alerts/background.js; do
+                   alerts/engine.js alerts/notify.js alerts/background.js config.js prices.js; do
             if [ ! -f "$f" ]; then echo "MISSING FILE IN REPO: $f"; missing=1; fi
           done
           if [ "$missing" = "1" ]; then echo "Upload the missing files (keep the folder names) and run again."; exit 1; fi
       - name: Create Expo project and copy our files in
         run: |
           npx create-expo-app@latest build --template "${{ inputs.template || 'blank' }}" --no-install --yes
-          tar --exclude='./.git' --exclude='./.github' --exclude='./build' --exclude='./README.md' -cf - . | tar -xf - -C build
+          tar --exclude='./.git' --exclude='./.github' --exclude='./build' --exclude='./web' --exclude='./README.md' -cf - . | tar -xf - -C build
           cd build
           npm pkg set main=index.js
           npm install
-          npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar react-native-android-widget expo-notifications expo-task-manager expo-background-task
+          npx expo install @react-navigation/native @react-navigation/bottom-tabs react-native-screens react-native-safe-area-context @react-native-async-storage/async-storage expo-status-bar react-native-android-widget expo-notifications expo-task-manager expo-background-task expo-clipboard
       - name: Quick JavaScript check (catches import mistakes in about a minute, before the long build)
         working-directory: build
         run: npx expo export --platform android --output-dir /tmp/js-check
