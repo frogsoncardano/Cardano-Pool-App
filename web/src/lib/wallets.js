@@ -25,6 +25,7 @@ export const realEnv = {
   },
   makeFetcher: async (network) => {
     const { KoiosProvider } = await import('@meshsdk/core');
-    return new KoiosProvider(network === 'mainnet' ? 'api' : network);
+    const token = (typeof import.meta !== 'undefined' && import.meta.env && import.meta.env.VITE_KOIOS_TOKEN) || undefined;
+    return new KoiosProvider(network === 'mainnet' ? 'api' : network, token);
   },
 };

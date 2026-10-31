@@ -28,3 +28,14 @@ Users sign in THEIR OWN wallet; Frog Labs never sees keys. The signing page is a
 4. Put that address into config.js (DAPP_URL, keep the trailing slash), then run "Build Android APK" again.
 Users open the link inside their wallet's built-in browser (Eternl, Vespr, Begin ...) or in a desktop browser with a wallet extension.
 Try it on a test network (preprod) wallet, or with a small amount on mainnet, before announcing it.
+
+Koios API token for the website (needed so people can see their staking data)
+---------------------------------------------------------------------------
+Koios blocks browser requests on its anonymous public tier, so the website needs a free API token.
+1. Go to https://koios.rest , connect a wallet, sign the message, and create a token on the Free plan.
+2. GitHub repo > Settings > Secrets and variables > Actions > New repository secret.
+   Name: KOIOS_TOKEN    Value: (paste the token)
+3. Actions > "Deploy web app (wallet actions)" > Run workflow.
+Note: the token ends up inside the public website code. That only lets others spend your free request quota
+(50,000 a day), so keep it separate from anything valuable. Free tokens expire periodically; renew it when the
+website says the data service "rejected our API token".

@@ -8,7 +8,7 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import { DEFAULT_SETTINGS, loadSettings, saveSettings, runAlertChecks, resetAlertState } from "./alerts/engine";
 import { notify, notificationsAllowed, askNotificationPermission } from "./alerts/notify";
 import * as Clipboard from "expo-clipboard";
-import { DAPP_URL } from "./config";
+import { DAPP_URL, FROG_POOL_ID } from "./config";
 import { getPrices, readCachedPrices } from "./prices";
 const POOL_ID = "pool154xmvhp4jnz7phwcla09uvzqnn3ch54lh2yzrt2znxdgc4trp8x";
 const KOIOS_BASE = "https://api.koios.rest/api/v1";
@@ -575,6 +575,16 @@ function EpochScreen() {
         <Row label="Volume" value={fmtAda(ep.out_sum)} />
         <Row label="Ends" value={new Date(ep.end_time * 1e3).toLocaleString()} />
       </Card>
+      <Pressable onPress={() => openWalletAction({ action: "pool", pool: FROG_POOL_ID })}>
+        <Card style={{ flexDirection: "row", alignItems: "center", borderColor: colors.green }}>
+          <Image source={{ uri: LOGO_URI }} style={{ width: 40, height: 40, borderRadius: 20 }} />
+          <View style={{ flex: 1, marginLeft: 12 }}>
+            <Text style={{ color: colors.text, fontWeight: "800" }}>Stake with Frog Labs</Text>
+            <Text style={{ color: colors.muted, fontSize: 12 }}>Pool [LEAP] · you sign in your own wallet</Text>
+          </View>
+          <Text style={{ color: colors.green, fontWeight: "800" }}>Stake to LEAP</Text>
+        </Card>
+      </Pressable>
       <PriceCards refreshKey={priceTick} />
     </Screen>;
 }

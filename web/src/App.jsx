@@ -3,6 +3,7 @@ import { realEnv } from './lib/wallets.js';
 import { koios } from './lib/koios.js';
 import { normalizePoolId, isDRepId, short, fmtAda, ada } from './lib/ids.js';
 import { friendlyError } from './lib/errors.js';
+import { FROG_POOL } from './config.js';
 
 const EXPLORER = { mainnet: 'https://cexplorer.io/tx/', preprod: 'https://preprod.cexplorer.io/tx/', preview: 'https://preview.cexplorer.io/tx/' };
 const TABS = [['pool', 'Stake to a pool'], ['drep', 'Voting power'], ['withdraw', 'Withdraw rewards']];
@@ -18,6 +19,8 @@ export default function App({ env = realEnv }) {
   const [testNet, setTestNet] = useState('preprod');
   const [conn, setConn] = useState(null); // connected wallet and what we learned about it
   const [account, setAccount] = useState(null);
+  const [accountError, setAccountError] = useState('');
+  const [preset, setPreset] = useState({ pool: params.get('pool') || '', n: 0 });
   const [busy, setBusy] = useState('');
   const [error, setError] = useState('');
   const [review, setReview] = useState(null);
@@ -35,12 +38,16 @@ export default function App({ env = realEnv }) {
   const network = conn ? conn.network : 'mainnet';
   const k = useMemo(() => koios(network), [network]);
 
+  // Reads staking status (registered? which pool? which DRep? rewards?). It must succeed before we build anything,
+  // because the transaction depends on it (for example whether the stake address still needs registering).
   const refreshAccount = useCallback(async (c) => {
+    setAccountError('');
     try {
       const info = await koios(c.network).accountInfo(c.rewardAddress);
       setAccount(info || { status: 'not registered' });
     } catch (e) {
       setAccount(null);
+      setAccountError(String((e && e.message) || e));
     }
   }, []);
 
@@ -62,7 +69,7 @@ export default function App({ env = realEnv }) {
     }
     setBusy('');
   }
-  function disconnect() { setConn(null); setAccount(null); setReview(null); setResult(null); setError(''); }
+  function disconnect() { setConn(null); setAccount(null); setAccountError(''); setReview(null); setResult(null); setError(''); }
   async function switchTestNet(v) {
     setTestNet(v);
     if (conn && conn.networkId !== 1) { const c = { ...conn, network: v }; setConn(c); await refreshAccount(c); }
@@ -70,13 +77,15 @@ export default function App({ env = realEnv }) {
 
   // Build the transaction, read it back, and show it for review. Nothing is signed yet.
   async function prepare(kind, ctxExtra, lines) {
-    setError(''); setResult(null); setBusy('Building the transaction…');
+    setError(''); setResult(null);
+    if (!account) { setError('Your staking status could not be read yet, so nothing was built. Tap "Retry" in the wallet card and try again.'); return; }
+    setBusy('Building the transaction…');
     try {
       const fetcher = await env.makeFetcher(conn.network);
       const { buildPoolDelegation, buildVoteDelegation, buildWithdrawal, describeTx } = await import('./lib/tx.js');
       const utxos = await conn.api.getUtxos();
       if (!utxos || utxos.length === 0) throw new Error('Your wallet has no spendable ADA, so it cannot pay the network fee.');
-      const register = !account || account.status !== 'registered';
+      const register = account.status !== 'registered';
       const ctx = { network: conn.network, fetcher, utxos, changeAddress: conn.change, rewardAddress: conn.rewardAddress, register, ...ctxExtra };
       const hex = kind === 'pool' ? await buildPoolDelegation(ctx) : kind === 'drep' ? await buildVoteDelegation(ctx) : await buildWithdrawal(ctx);
       const d = describeTx(hex);
@@ -109,7 +118,7 @@ export default function App({ env = realEnv }) {
         <div><h1>Frog Labs · Wallet actions</h1><div className="sub">Your keys stay in your wallet. We build the transaction, you check it and sign it there.</div></div>
       </header>
 
-      <WalletCard {...{ wallets, conn, account, busy, connect, disconnect, testNet, switchTestNet, k }} />
+      <WalletCard {...{ wallets, conn, account, accountError, busy, connect, disconnect, testNet, switchTestNet, k, retry: () => refreshAccount(conn) }} />
 
       {error ? <div className="card bad"><span className="badText">{error}</span></div> : null}
       {busy ? <div className="card"><span className="muted">{busy}</span></div> : null}
@@ -125,11 +134,20 @@ export default function App({ env = realEnv }) {
         </div>
       ) : null}
 
+      <div className="card" style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+        <img src="./logo.png" alt="" style={{ width: 40, height: 40, borderRadius: '50%' }} />
+        <div style={{ flex: 1 }}>
+          <b>Stake with Frog Labs</b>
+          <div className="muted">Pool [{FROG_POOL.ticker}] · you sign in your own wallet</div>
+        </div>
+        <button className="ghost" onClick={() => { setTab('pool'); setReview(null); setResult(null); setError(''); setPreset((p) => ({ pool: FROG_POOL.id, n: p.n + 1 })); }}>Stake to {FROG_POOL.ticker}</button>
+      </div>
+
       <div className="tabs">{TABS.map(([id, label]) => <button key={id} className={'tab' + (tab === id ? ' active' : '')} onClick={() => { setTab(id); setReview(null); setError(''); }}>{label}</button>)}</div>
 
       {!conn ? <div className="card"><span className="muted">Connect a wallet above to continue.</span></div> : (
         <>
-          {tab === 'pool' && <PoolTab {...{ k, params, prepare, account, busy }} />}
+          {tab === 'pool' && <PoolTab {...{ k, preset, prepare, account, busy }} />}
           {tab === 'drep' && <DRepTab {...{ k, params, prepare, account, busy }} />}
           {tab === 'withdraw' && <WithdrawTab {...{ prepare, account, busy, goVoting: () => setTab('drep') }} />}
         </>
@@ -144,7 +162,7 @@ export default function App({ env = realEnv }) {
   );
 }
 
-function WalletCard({ wallets, conn, account, busy, connect, disconnect, testNet, switchTestNet, k }) {
+function WalletCard({ wallets, conn, account, accountError, busy, connect, disconnect, testNet, switchTestNet, k, retry }) {
   const [poolName, setPoolName] = useState('');
   useEffect(() => {
     let alive = true;
@@ -177,16 +195,23 @@ function WalletCard({ wallets, conn, account, busy, connect, disconnect, testNet
       ) : null}
       <Row label="Address" value={short(conn.change, 10)} />
       <Row label="Balance" value={fmtAda(conn.lovelace)} />
-      <Row label="Stake address" value={account ? (account.status === 'registered' ? 'registered' : 'not registered yet') : '…'} />
+      <Row label="Stake address" value={short(conn.rewardAddress, 10)} />
+      <Row label="Stake status" value={account ? (account.status === 'registered' ? 'registered' : 'not registered yet') : accountError ? 'unavailable' : 'checking…'} cls={accountError ? 'warnText' : ''} />
       <Row label="Staked to" value={account && account.delegated_pool ? poolName || short(account.delegated_pool, 8) : 'no pool yet'} />
       <Row label="Voting power" value={drepText} cls={drep ? '' : 'warnText'} />
       <Row label="Rewards available" value={account ? fmtAda(account.rewards_available) : '…'} />
+      {accountError ? (
+        <div style={{ marginTop: 8 }}>
+          <div className="warnText" style={{ fontSize: 13 }}>{accountError}</div>
+          <button className="ghost" style={{ marginTop: 8 }} onClick={retry}>Retry</button>
+        </div>
+      ) : null}
     </div>
   );
 }
 
-function PoolTab({ k, params, prepare, account, busy }) {
-  const [q, setQ] = useState(params.get('pool') || '');
+function PoolTab({ k, preset, prepare, account, busy }) {
+  const [q, setQ] = useState(preset.pool || '');
   const [results, setResults] = useState([]);
   const [pool, setPool] = useState(null);
   const [msg, setMsg] = useState('');
@@ -198,7 +223,7 @@ function PoolTab({ k, params, prepare, account, busy }) {
       else if (text.trim().length >= 2) { const r = await k.searchPools(text); setResults(r); if (r.length === 0) setMsg('No pools found.'); }
     } catch (e) { setMsg('Could not reach the pool data service. Try again in a moment.'); }
   }, [k]);
-  useEffect(() => { if (params.get('pool')) search(params.get('pool')); }, []); // eslint-disable-line
+  useEffect(() => { if (preset.pool) { setQ(preset.pool); search(preset.pool); } }, [preset.n]); // eslint-disable-line
   const meta = (pool && pool.meta_json) || {};
   const sat = pool ? Number(pool.live_saturation || 0) : 0;
   const retiring = pool && (pool.retiring_epoch != null || (pool.pool_status && pool.pool_status !== 'registered'));

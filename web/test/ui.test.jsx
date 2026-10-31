@@ -14,12 +14,13 @@ const { default: App } = await import('../src/App.jsx');
 
 const POOL = 'pool154xmvhp4jnz7phwcla09uvzqnn3ch54lh2yzrt2znxdgc4trp8x';
 const L = (a) => String(Math.round(a * 1e6));
+let accountFail = true;
 let account = { status: 'not registered', delegated_pool: null, delegated_drep: null, rewards_available: '0' };
 const submitted = [];
 const quiet = console.error; const errors = []; console.error = (...a) => { const m = a.map(String).join(' '); if (!/ReactDOMTestUtils|act\(/.test(m)) errors.push(m.slice(0, 200)); };
 globalThis.fetch = async (url, opts = {}) => {
   const u = String(url); const J = (b) => ({ ok: true, status: 200, json: async () => b });
-  if (u.includes('/account_info')) return J([account]);
+  if (u.includes('/account_info')) { if (accountFail) throw new TypeError('Failed to fetch'); return J([account]); }
   if (u.includes('/pool_info')) return J([{ pool_id_bech32: POOL, meta_json: { ticker: 'LEAP', name: 'Leap pool' }, pool_status: 'registered', live_stake: L(4e6), margin: 0, fixed_cost: L(170), pledge: L(100), live_delegators: 82, live_saturation: 5.08, retiring_epoch: null }]);
   if (u.includes('/pool_list')) return J([{ pool_id_bech32: POOL }]);
   if (u.includes('/drep_info')) return J([{ registered: true, active: true, amount: L(2e6) }]);
@@ -53,13 +54,29 @@ const certsOf = (hex) => deserializeTx(hex).body().certs().values().map((c) => c
 await act(async () => { root.render(React.createElement(App, { env })); }); await settle(900);
 check('wallet button listed', /FakeWallet/.test(text()));
 await clickText(/^FakeWallet$/); await settle(600);
-check('connected, test network shown', /Test network \(preprod\)/.test(text()) && /80 ₳/.test(text()), text().slice(text().indexOf('Network'), text().indexOf('Network') + 140));
-check('account shows not registered / no voting power', /not registered yet/.test(text()) && /none yet/.test(text()));
+check('connected, test network shown', /Test network \(preprod\)/.test(text()) && /80 ₳/.test(text()));
+check('stake address is shown even when chain data is blocked', /Stake address/.test(text()) && /stake_test…/.test(text()), (text().match(/Stake address[^S]{0,24}/) || [''])[0]);
+check('blocked chain data is explained and a Retry button appears', /unavailable/.test(text()) && /blocked this browser request/.test(text()) && /Retry/.test(text()));
 
-// ---- pool delegation
+// search still works while account data is unavailable
 await typeInto('input[type=search]', 'LEAP'); await clickText(/^Search$/); await settle(500);
 await clickText(/\[LEAP\] Leap pool/, 'div.pool');
 check('pool card shown with saturation + fee', /5\.1%/.test(text()) && /170/.test(text()));
+
+// nothing must be built while we do not know the staking status
+await clickText(/Review delegation/); await settle(500);
+check('no transaction is built without staking status', /could not be read yet/.test(text()) && !/Review before you sign/.test(text()));
+
+// the data comes back after Retry
+accountFail = false;
+await clickText(/^Retry$/); await settle(600);
+check('Retry loads the staking status', /not registered yet/.test(text()) && /none yet/.test(text()) && !/blocked this browser request/.test(text()));
+
+// ---- Stake to LEAP shortcut
+await clickText(/^Voting power$/);
+await clickText(/Stake to LEAP/);
+await settle(800);
+check('LEAP shortcut opens the pool tab with LEAP loaded', /Choose a pool/.test(text()) && /\[LEAP\] Leap pool/.test(text()));
 await clickText(/Review delegation/); await settle(900);
 check('review card has fee and the refundable deposit (first stake)', /Review before you sign/.test(text()) && /Network fee/.test(text()) && /Refundable deposit/.test(text()), (text().match(/Network fee[^A-Z]{0,14}/) || [''])[0]);
 await clickText(/Sign in FakeWallet/); await settle(900);
